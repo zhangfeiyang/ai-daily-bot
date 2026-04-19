@@ -20,7 +20,15 @@ reddit:
   time_filter: day
 
 twitter:
-  enabled: false
+  enabled: true
+  accounts:
+    - OpenAI
+    - GoogleAI
+    - AnthropicAI
+    - GoogleDeepMind
+    - ylecun
+    - karpathy
+  limit: 20
   nitter_instances:
     - https://nitter.net
     - https://nitter.privacydev.net

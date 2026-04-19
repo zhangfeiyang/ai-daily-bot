@@ -1,6 +1,8 @@
 # src/publish/wechat.py
+import json
 import time
 from pathlib import Path
+
 import requests
 from loguru import logger
 
@@ -74,13 +76,17 @@ class WeChatPublisher:
         self,
         title: str,
         content: str,
-        audio_media_id: str = "",
+        audio_path: str = "",
         thumb_media_id: str = "",
     ) -> str:
         token = self._get_access_token()
+
+        # Upload audio if provided
+        audio_media_id = ""
+        if audio_path:
+            audio_media_id = self.upload_audio(audio_path)
+
         body = content
-        if audio_media_id:
-            body += f'\n<mpvoice voice_encode_fileid="{audio_media_id}" />'
 
         # If no thumb provided, upload a default one
         if not thumb_media_id:
@@ -98,7 +104,12 @@ class WeChatPublisher:
                 }
             ],
         }
-        resp = requests.post(draft_url, params={"access_token": token}, json=draft_data)
+        resp = requests.post(
+            draft_url,
+            params={"access_token": token},
+            data=json.dumps(draft_data, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
         resp.raise_for_status()
         draft = resp.json()
 

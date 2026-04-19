@@ -69,7 +69,7 @@ def test_wechat_publish_article(mock_get, mock_post):
     result = publisher.publish_article(
         title="AI 日报",
         content="<p>Test content</p>",
-        audio_media_id="media_abc",
+        audio_path="",
         thumb_media_id="thumb_abc",
     )
     assert result == "pub_123"

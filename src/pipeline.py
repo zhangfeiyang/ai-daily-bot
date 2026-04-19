@@ -10,6 +10,22 @@ from src.publish.wechat import WeChatPublisher as WechatPublisher
 from src.tts.engine import TTSEngine
 
 
+def _render_table(rows: list[list[str]]) -> str:
+    """将表格行列表转为 HTML 表格。"""
+    if not rows:
+        return ""
+    html = '<table style="width:100%;border-collapse:collapse;margin:10px 0;font-size:14px;">'
+    for i, cells in enumerate(rows):
+        tag = "th" if i == 0 else "td"
+        bg = "background-color:#f0f0f5;" if i == 0 else ""
+        html += "<tr>"
+        for cell in cells:
+            html += f'<{tag} style="border:1px solid #ddd;padding:6px 10px;{bg}">{cell}</{tag}>'
+        html += "</tr>"
+    html += "</table>"
+    return html
+
+
 class Pipeline:
     def __init__(
         self,
@@ -80,12 +96,11 @@ class Pipeline:
 
             # 5. Publish
             logger.info("Publishing to WeChat...")
-            audio_media_id = self.publisher.upload_audio(audio_path)
             title = f"AI 科技前沿 | {today}"
             publish_id = self.publisher.publish_article(
                 title=title,
                 content=article_html,
-                audio_media_id=audio_media_id,
+                audio_path=audio_path,
             )
             logger.info(f"Published successfully, publish_id={publish_id}")
             return True
@@ -127,10 +142,35 @@ class Pipeline:
     @staticmethod
     def _markdown_to_html(text: str) -> str:
         """将 LLM 输出的 Markdown 风格文本转为公众号友好的 HTML。"""
+        # Convert markdown links [text](url) to HTML <a> tags
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" style="color:#e94560;">\1</a>', text)
+
+        # Convert markdown tables to HTML tables
         lines = text.strip().split("\n")
         html_parts = []
+        in_table = False
+        table_rows = []
+
         for line in lines:
             stripped = line.strip()
+
+            # Table row detection
+            if stripped.startswith("|") and stripped.endswith("|"):
+                # Skip separator rows like | --- | --- |
+                if re.match(r'^\|[\s\-|]+\|$', stripped):
+                    continue
+                cells = [c.strip() for c in stripped.split("|")[1:-1]]
+                if not in_table:
+                    in_table = True
+                    table_rows = []
+                table_rows.append(cells)
+                continue
+            elif in_table:
+                # End of table, render it
+                html_parts.append(_render_table(table_rows))
+                in_table = False
+                table_rows = []
+
             if stripped.startswith("## "):
                 html_parts.append(f'<h2 style="color:#1a1a2e;border-bottom:2px solid #e94560;padding-bottom:8px;">{stripped[3:]}</h2>')
             elif stripped.startswith("# "):
@@ -141,4 +181,9 @@ class Pipeline:
                 html_parts.append("")
             else:
                 html_parts.append(f"<p>{stripped}</p>")
+
+        # Handle table at end of text
+        if in_table and table_rows:
+            html_parts.append(_render_table(table_rows))
+
         return "\n".join(html_parts)
