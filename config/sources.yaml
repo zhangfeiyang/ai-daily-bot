@@ -20,7 +20,7 @@ reddit:
   time_filter: day
 
 twitter:
-  enabled: true
+  enabled: false
   nitter_instances:
     - https://nitter.net
     - https://nitter.privacydev.net

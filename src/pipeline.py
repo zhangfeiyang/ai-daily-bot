@@ -53,7 +53,15 @@ class Pipeline:
             template_name = "daily" if self.mode == "daily" else "weekly"
 
             system_prompt = load_prompt(template_name, date=today, news_content=news_text)
-            article_html = self.llm.generate(system_prompt, news_text)
+            article_text = self.llm.generate(system_prompt, news_text)
+
+            # Convert markdown-style text to HTML for WeChat
+            article_html = self._markdown_to_html(article_text)
+
+            # Truncate if too long for WeChat (limit ~20000 chars)
+            if len(article_html) > 20000:
+                article_html = article_html[:20000]
+                logger.warning("Article truncated to 20000 chars for WeChat compatibility")
 
             # Save article
             output_dir = Path("output/articles")
@@ -115,3 +123,22 @@ class Pipeline:
         text = re.sub(r"<[^>]+>", "", html)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    @staticmethod
+    def _markdown_to_html(text: str) -> str:
+        """将 LLM 输出的 Markdown 风格文本转为公众号友好的 HTML。"""
+        lines = text.strip().split("\n")
+        html_parts = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                html_parts.append(f'<h2 style="color:#1a1a2e;border-bottom:2px solid #e94560;padding-bottom:8px;">{stripped[3:]}</h2>')
+            elif stripped.startswith("# "):
+                html_parts.append(f'<h1 style="color:#1a1a2e;">{stripped[2:]}</h1>')
+            elif stripped.startswith("- ") or stripped.startswith("* "):
+                html_parts.append(f'<p style="margin-left:16px;">• {stripped[2:]}</p>')
+            elif stripped == "":
+                html_parts.append("")
+            else:
+                html_parts.append(f"<p>{stripped}</p>")
+        return "\n".join(html_parts)
