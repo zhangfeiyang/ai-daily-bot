@@ -32,14 +32,19 @@ def test_llm_client_generate_openai():
     }
     client = LLMClient(config)
 
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "Generated article content"
+    # Mock streaming response
+    mock_chunk1 = MagicMock()
+    mock_chunk1.choices = [MagicMock()]
+    mock_chunk1.choices[0].delta.content = "Generated article content"
+
+    mock_chunk2 = MagicMock()
+    mock_chunk2.choices = [MagicMock()]
+    mock_chunk2.choices[0].delta.content = None
 
     with patch("openai.OpenAI") as mock_openai_cls:
         mock_openai = MagicMock()
         mock_openai_cls.return_value = mock_openai
-        mock_openai.chat.completions.create.return_value = mock_response
+        mock_openai.chat.completions.create.return_value = iter([mock_chunk1, mock_chunk2])
 
         result = client.generate("system prompt", "user prompt")
         assert result == "Generated article content"

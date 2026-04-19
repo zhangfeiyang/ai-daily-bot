@@ -1,4 +1,4 @@
-default: openai
+default: custom
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -10,5 +10,5 @@ providers:
     model: claude-sonnet-4-6-20250514
   custom:
     api_key: ${CUSTOM_API_KEY}
-    base_url: https://your-endpoint/v1
-    model: your-model
+    base_url: https://codex.mydamoxing.cn/v1
+    model: gpt-5.4

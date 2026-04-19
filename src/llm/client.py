@@ -25,8 +25,13 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            stream=True,
         )
-        return response.choices[0].message.content
+        chunks = []
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                chunks.append(chunk.choices[0].delta.content)
+        return "".join(chunks)
 
     def _generate_anthropic(self, system_prompt: str, user_prompt: str) -> str:
         import anthropic
