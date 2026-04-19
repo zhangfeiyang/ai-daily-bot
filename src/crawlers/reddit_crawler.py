@@ -1,43 +1,66 @@
 # src/crawlers/reddit_crawler.py
-import os
 from datetime import datetime, timezone
-import praw
+from email.utils import parsedate_to_datetime
+
+import feedparser
+import requests
+from loguru import logger
+
 from src.crawlers.base import BaseCrawler
 from src.models import NewsItem
 
 
 class RedditCrawler(BaseCrawler):
     def fetch(self) -> list[NewsItem]:
-        reddit = praw.Reddit(
-            client_id=os.environ.get("REDDIT_CLIENT_ID", ""),
-            client_secret=os.environ.get("REDDIT_CLIENT_SECRET", ""),
-            user_agent=os.environ.get("REDDIT_USER_AGENT", "ai-news-bot/1.0"),
-        )
         subreddits = self.config.get("subreddits", ["MachineLearning"])
         sort = self.config.get("sort", "hot")
         limit = self.config.get("limit", 15)
 
         items = []
         for sub_name in subreddits:
-            subreddit = reddit.subreddit(sub_name)
-            if sort == "hot":
-                submissions = subreddit.hot(limit=limit)
-            elif sort == "new":
-                submissions = subreddit.new(limit=limit)
-            else:
-                submissions = subreddit.top(time_filter=self.config.get("time_filter", "day"), limit=limit)
+            url = f"https://www.reddit.com/r/{sub_name}/{sort}/.rss?limit={limit}"
+            try:
+                resp = requests.get(url, headers={"User-Agent": "ai-news-bot/1.0"}, timeout=15)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                logger.warning(f"Reddit: failed to fetch r/{sub_name}: {e}")
+                continue
 
-            for s in submissions:
-                if s.stickied:
+            feed = feedparser.parse(resp.text)
+            for entry in feed.get("entries", [])[:limit]:
+                title = entry.get("title", "")
+                # Skip stickied posts (usually subreddit rules)
+                if any(kw in title.lower() for kw in ["megathread", "weekly thread", "rules"]):
                     continue
+
+                link = entry.get("link", "")
+                content = entry.get("summary", title)
+                # Strip HTML from summary
+                import re
+                content = re.sub(r"<[^>]+>", "", content)[:2000]
+
+                author = entry.get("author", "")
+                # Reddit RSS author format: "/u/username"
+                if author.startswith("/u/"):
+                    author = author[3:]
+
+                try:
+                    pub_date = parsedate_to_datetime(entry.get("published", ""))
+                except Exception:
+                    pub_date = datetime.now(timezone.utc)
+
+                # Extract flair from tags
+                tags = [t.get("term", "") for t in entry.get("tags", []) if t.get("term")]
+
                 items.append(NewsItem(
                     source="reddit",
-                    title=s.title,
-                    url=f"https://reddit.com{s.permalink}",
-                    content=s.selftext[:2000] if s.selftext else s.title,
-                    author=s.author.name if s.author else "[deleted]",
-                    published_at=datetime.fromtimestamp(s.created_utc, tz=timezone.utc),
-                    tags=[s.link_flair_text] if s.link_flair_text else [],
-                    raw_data={"score": s.score, "num_comments": s.num_comments, "subreddit": sub_name},
+                    title=title,
+                    url=link,
+                    content=content,
+                    author=author,
+                    published_at=pub_date,
+                    tags=tags,
+                    raw_data={"subreddit": sub_name},
                 ))
+
         return items
