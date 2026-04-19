@@ -85,3 +85,40 @@ def test_arxiv_crawler_fetch(mock_arxiv_mod):
     items = crawler.fetch()
     assert len(items) == 1
     assert items[0].source == "arxiv"
+
+
+from src.crawlers.reddit_crawler import RedditCrawler
+
+
+@patch("src.crawlers.reddit_crawler.praw")
+def test_reddit_crawler_fetch(mock_praw):
+    mock_reddit = MagicMock()
+    mock_praw.Reddit.return_value = mock_reddit
+
+    mock_submission = MagicMock()
+    mock_submission.title = "New breakthrough in LLM"
+    mock_submission.url = "https://reddit.com/r/MachineLearning/comments/abc"
+    mock_submission.selftext = "Check out this new paper..."
+    mock_submission.author.name = "ml_researcher"
+    mock_submission.created_utc = 1713500400.0
+    mock_submission.link_flair_text = "Research"
+    mock_submission.score = 200
+    mock_submission.num_comments = 50
+    mock_submission.stickied = False
+    mock_submission.permalink = "/r/MachineLearning/comments/abc"
+
+    mock_subreddit = MagicMock()
+    mock_subreddit.hot.return_value = [mock_submission]
+    mock_reddit.subreddit.return_value = mock_subreddit
+
+    crawler = RedditCrawler({
+        "enabled": True,
+        "subreddits": ["MachineLearning"],
+        "sort": "hot",
+        "limit": 10,
+        "time_filter": "day",
+    })
+    items = crawler.fetch()
+    assert len(items) >= 1
+    assert items[0].source == "reddit"
+    assert items[0].title == "New breakthrough in LLM"
