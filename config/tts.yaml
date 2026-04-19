@@ -1,0 +1,5 @@
+default: edge-tts
+edge-tts:
+  voice: zh-CN-YunxiNeural
+  rate: "+0%"
+  output_format: mp3

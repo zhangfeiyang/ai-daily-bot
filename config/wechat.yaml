@@ -1,0 +1,2 @@
+app_id: ${WECHAT_APP_ID}
+app_secret: ${WECHAT_APP_SECRET}

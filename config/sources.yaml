@@ -1,0 +1,34 @@
+arxiv:
+  enabled: true
+  categories:
+    - cs.AI
+    - cs.CL
+    - cs.CV
+    - cs.LG
+  max_results: 20
+  sort_by: submittedDate
+
+reddit:
+  enabled: true
+  subreddits:
+    - MachineLearning
+    - artificial
+    - ChatGPT
+    - LocalLLaMA
+  sort: hot
+  limit: 15
+  time_filter: day
+
+twitter:
+  enabled: true
+  nitter_instances:
+    - https://nitter.net
+    - https://nitter.privacydev.net
+  accounts:
+    - OpenAI
+    - GoogleAI
+    - AnthropicAI
+    - GoogleDeepMind
+    - ylecun
+    - karpathy
+  limit: 20
