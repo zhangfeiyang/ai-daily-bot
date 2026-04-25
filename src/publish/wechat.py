@@ -76,15 +76,20 @@ class WeChatPublisher:
         self,
         title: str,
         content: str,
-        audio_path: str = "",
+        audio_paths: list[str] | None = None,
         thumb_media_id: str = "",
     ) -> str:
         token = self._get_access_token()
 
-        # Upload audio if provided
-        audio_media_id = ""
-        if audio_path:
-            audio_media_id = self.upload_audio(audio_path)
+        # Upload audio parts if provided
+        if audio_paths:
+            for i, ap in enumerate(audio_paths):
+                sz = Path(ap).stat().st_size
+                if sz <= 2 * 1024 * 1024:
+                    media_id = self.upload_audio(ap)
+                    logger.info(f"Audio part {i+1}/{len(audio_paths)} uploaded, media_id={media_id}")
+                else:
+                    logger.warning(f"Audio part {i+1} still too large ({sz/1024/1024:.1f}MB), skipped")
 
         body = content
 
@@ -97,7 +102,7 @@ class WeChatPublisher:
             "articles": [
                 {
                     "title": title,
-                    "author": "AI",
+                    "author": "张飞洋",
                     "content": body,
                     "thumb_media_id": thumb_media_id,
                     "need_open_comment": 1,
@@ -174,3 +179,25 @@ class WeChatPublisher:
         self._default_thumb_media_id = data["media_id"]
         logger.info(f"Default thumb uploaded, media_id={data['media_id']}")
         return data["media_id"]
+
+    def upload_image(self, image_path: str) -> str:
+        """Upload an image for use in article content, returns URL.
+
+        Uses the /media/uploadimg API which returns a URL for embedding.
+        """
+        token = self._get_access_token()
+        url = f"{self.BASE_URL}/media/uploadimg"
+        params = {"access_token": token}
+
+        with open(image_path, "rb") as f:
+            files = {"media": (Path(image_path).name, f, "image/png")}
+            resp = requests.post(url, params=params, files=files)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "url" not in data:
+            logger.warning(f"WeChat upload image failed: {data}")
+            return ""
+
+        logger.info(f"Image uploaded for article: {data['url'][:50]}...")
+        return data["url"]

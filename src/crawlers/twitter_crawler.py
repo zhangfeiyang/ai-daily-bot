@@ -1,6 +1,7 @@
 # src/crawlers/twitter_crawler.py
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import unquote
 import re
 
 import feedparser
@@ -19,12 +20,34 @@ DEFAULT_INSTANCES = [
 
 
 class TwitterCrawler(BaseCrawler):
+    # AI 相关关键词，用于过滤非 AI 内容
+    AI_KEYWORDS = [
+        "ai", "artificial intelligence", "machine learning", "deep learning",
+        "neural", "llm", "gpt", "transformer", "model", "agi",
+        "chatgpt", "claude", "gemini", "openai", "anthropic",
+        "diffusion", "rlhf", "fine-tun", "inference", "training",
+        "nlp", "computer vision", "robot", "autonomous",
+        "hugging face", "pytorch", "tensorflow", "cuda", "gpu",
+        "reasoning", "embedding", "token", "benchmark", "sota",
+        "multimodal", "generation", "classifier", "tokenizer",
+        "人工智能", "大模型", "深度学习", "机器学习", "神经网络",
+        "智能体", "开源模型", "推理", "训练",
+    ]
+
+    # 泛娱乐等话题关键词，用于排除
+    EXCLUDE_KEYWORDS = [
+        "football", "nba", "soccer", "game today", "box office",
+        "movie review", "celebrity", "gossip", "recipe", "cooking",
+        "travel vlog", "music video", "concert", "fashion",
+        "fantasy football", "super bowl", "playoff",
+    ]
+
     def fetch(self) -> list[NewsItem]:
         instances = self.config.get("nitter_instances", DEFAULT_INSTANCES)
         accounts = self.config.get("accounts", [])
         limit = self.config.get("limit", 20)
+        filter_ai = self.config.get("filter_ai_only", False)
 
-        # Find a working instance
         instance = self._find_working_instance(instances)
         if not instance:
             logger.error("Twitter: no working Nitter instance found")
@@ -47,13 +70,15 @@ class TwitterCrawler(BaseCrawler):
             feed = feedparser.parse(resp.text)
             for entry in feed.get("entries", [])[:limit]:
                 title = entry.get("title", "")
-                # Skip empty or error entries
                 if not title or "whitelisted" in title.lower():
                     continue
 
-                # Strip HTML from summary
                 summary = entry.get("summary", "")
-                summary = re.sub(r"<[^>]+>", "", summary)
+                summary_text = re.sub(r"<[^>]+>", "", summary)
+
+                # AI content filter
+                if filter_ai and not self._is_ai_related(title + " " + summary_text):
+                    continue
 
                 try:
                     pub_date = parsedate_to_datetime(entry.get("published", ""))
@@ -66,18 +91,40 @@ class TwitterCrawler(BaseCrawler):
                 if author.startswith("@"):
                     author = author[1:]
 
+                url = entry.get("link", "")
+                url = re.sub(r"https?://[^/]+", "https://x.com", url)
+
+                image_url = ""
+                img_match = re.search(r'<img[^>]+src="([^"]+)"', entry.get("summary", ""))
+                if img_match:
+                    image_url = img_match.group(1)
+                    # Nitter returns encoded URLs like /pic/media%2Fxxx.jpg
+                    # Decode and rebuild proper Twitter image URL
+                    image_url = unquote(image_url)
+                    image_url = re.sub(r"https?://[^/]+/pic/", "https://pbs.twimg.com/", image_url)
+
                 items.append(NewsItem(
                     source="twitter",
                     title=title,
-                    url=entry.get("link", ""),
-                    content=summary[:2000],
+                    url=url,
+                    content=summary_text[:2000],
                     author=author,
                     published_at=pub_date,
                     tags=["twitter"],
-                    raw_data={"account": account},
+                    raw_data={"account": account, "image_url": image_url},
                 ))
 
-        return items
+        return self.filter_recent(items)
+
+    def _is_ai_related(self, text: str) -> bool:
+        """Check if tweet content is AI-related."""
+        text_lower = text.lower()
+        # Exclude non-AI topics first
+        for kw in self.EXCLUDE_KEYWORDS:
+            if kw in text_lower:
+                return False
+        # Check for AI keywords
+        return any(kw in text_lower for kw in self.AI_KEYWORDS)
 
     def _find_working_instance(self, instances: list[str]) -> str:
         """测试并返回第一个可用的 Nitter 实例。"""

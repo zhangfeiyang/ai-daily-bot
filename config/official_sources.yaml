@@ -1,0 +1,164 @@
+# AI 公司官方渠道映射
+# pipeline 从这些渠道验证新闻的真实性
+
+openai:
+  keywords: ["openai", "gpt", "chatgpt", "codex", "dall-e", "sora", "o1", "o3", "o4"]
+  website: "https://openai.com"
+  blog: "https://openai.com/blog"
+  twitter: "OpenAI"
+  ceo_twitter: "sama"
+  model_leads:
+    - name: "GPT"
+      twitter: "sama"
+    - name: "DALL-E"
+      twitter: "sama"
+
+google:
+  keywords: ["google", "gemini", "deepmind", "tpu", "bard", "alphafold"]
+  website: "https://blog.google"
+  blog: "https://research.google/blog"
+  twitter: "GoogleAI"
+  ceo_twitter: "sundarpichai"
+  model_leads:
+    - name: "Gemini"
+      twitter: "GoogleDeepMind"
+    - name: "DeepMind"
+      twitter: "GoogleDeepMind"
+  sub_brands:
+    deepmind:
+      twitter: "GoogleDeepMind"
+      blog: "https://deepmind.google/blog"
+
+anthropic:
+  keywords: ["anthropic", "claude", "constitutional ai"]
+  website: "https://www.anthropic.com"
+  blog: "https://www.anthropic.com/news"
+  twitter: "AnthropicAI"
+  ceo_twitter: "daboross"
+  model_leads:
+    - name: "Claude"
+      twitter: "AnthropicAI"
+
+deepseek:
+  keywords: ["deepseek", "深度求索"]
+  website: "https://deepseek.com"
+  blog: "https://api-docs.deepseek.com"
+  twitter: "deepseek_ai"
+  wechat: "深度求索"
+  model_leads:
+    - name: "DeepSeek"
+      twitter: "deepseek_ai"
+
+xiaomi:
+  keywords: ["xiaomi", "小米", "mimo", "miln"]
+  website: "https://xiaomi.com"
+  twitter: "Xiaomi"
+  wechat: "小米公司"
+  model_leads:
+    - name: "MiMo"
+      twitter: "XiaomiMimo"
+  sub_brands:
+    mimo:
+      twitter: "XiaomiMimo"
+
+zhipu:
+  keywords: ["zhipu", "智谱", "chatglm", "glm", "thudm", "清言"]
+  website: "https://zhipuai.cn"
+  twitter: "zhipu_ai"
+  ceo_twitter: "THUDM"
+  wechat: "智谱AI"
+  model_leads:
+    - name: "GLM"
+      twitter: "zhipu_ai"
+    - name: "ChatGLM"
+      twitter: "zhipu_ai"
+
+minimax:
+  keywords: ["minimax", "海螺AI", "hailuo"]
+  website: "https://minimaxi.com"
+  twitter: "MiniMax_AI"
+  model_leads:
+    - name: "Hailuo"
+      twitter: "MiniMax_AI"
+
+kimi:
+  keywords: ["kimi", "moonshot", "月之暗面"]
+  website: "https://moonshot.cn"
+  twitter: "kimi_moonshot"
+  wechat: "Kimi智能助手"
+  model_leads:
+    - name: "Kimi"
+      twitter: "kimi_moonshot"
+
+alibaba:
+  keywords: ["alibaba", "阿里", "qwen", "通义", "千问", "tongyi"]
+  website: "https://qwenlm.github.io"
+  blog: "https://qwenlm.github.io/blog"
+  twitter: "Alibaba_Qwen"
+  model_leads:
+    - name: "Qwen"
+      twitter: "Alibaba_Qwen"
+
+meta:
+  keywords: ["meta", "llama", "facebook ai", "fair"]
+  website: "https://ai.meta.com"
+  blog: "https://ai.meta.com/blog"
+  twitter: "AIatMeta"
+  ceo_twitter: "zuck"
+  model_leads:
+    - name: "Llama"
+      twitter: "AIatMeta"
+
+mistral:
+  keywords: ["mistral", "mixtral"]
+  website: "https://mistral.ai"
+  blog: "https://mistral.ai/news"
+  twitter: "MistralAI"
+  ceo_twitter: "arthurmensch"
+  model_leads:
+    - name: "Mistral"
+      twitter: "MistralAI"
+    - name: "Mixtral"
+      twitter: "MistralAI"
+
+sakana:
+  keywords: ["sakana", "fugu"]
+  website: "https://sakana.ai"
+  blog: "https://sakana.ai/blog"
+  twitter: "SakanaAILabs"
+
+nvidia:
+  keywords: ["nvidia", "cuda", "gpu", "dgx", "blackwell", "hopper"]
+  website: "https://nvidia.com"
+  blog: "https://blogs.nvidia.com"
+  twitter: "nvidia"
+  ceo_twitter: "jensenhuang"
+  model_leads:
+    - name: "CUDA"
+      twitter: "nvidia"
+
+bytedance:
+  keywords: ["bytedance", "字节", "豆包", "doubao", "seed"]
+  website: "https://team.doubao.com"
+  wechat: "豆包大模型"
+  model_leads:
+    - name: "Doubao"
+      twitter: "doubao"
+    - name: "Seed"
+      twitter: "doubao"
+
+baidu:
+  keywords: ["baidu", "百度", "文心", "ernie", "wenxin"]
+  website: "https://yiyan.baidu.com"
+  wechat: "百度文心一言"
+
+huawei:
+  keywords: ["huawei", "华为", "盘古", "昇腾", "ascend"]
+  website: "https://huawei.com"
+  wechat: "华为"
+
+cohere:
+  keywords: ["cohere", "command", "rerank"]
+  website: "https://cohere.com"
+  blog: "https://cohere.com/blog"
+  twitter: "CohereAI"

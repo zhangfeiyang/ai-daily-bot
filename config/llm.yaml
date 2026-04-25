@@ -10,5 +10,13 @@ providers:
     model: claude-sonnet-4-6-20250514
   custom:
     api_key: ${CUSTOM_API_KEY}
-    base_url: https://codex.mydamoxing.cn/v1
-    model: gpt-5.4
+    base_url: https://mydamoxing.cn/v1
+    model: glm-5.1
+  vision:
+    api_key: ${VISION_API_KEY}
+    base_url: https://api.lkeap.cloud.tencent.com/coding/v3
+    model: kimi-k2.5
+  image:
+    api_key: ${IMAGE_API_KEY}
+    base_url: https://mydamoxing.cn/v1
+    model: gpt-image-2

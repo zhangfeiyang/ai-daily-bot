@@ -52,6 +52,19 @@ class RedditCrawler(BaseCrawler):
                 # Extract flair from tags
                 tags = [t.get("term", "") for t in entry.get("tags", []) if t.get("term")]
 
+                # Extract image URL from summary or media_content
+                import html as html_lib
+                image_url = ""
+                media = entry.get("media_content", [])
+                for m in media:
+                    if m.get("medium") == "image" or m.get("type", "").startswith("image"):
+                        image_url = html_lib.unescape(m.get("url", ""))
+                        break
+                if not image_url:
+                    img_match = re.search(r'<img[^>]+src="([^"]+)"', entry.get("summary", ""))
+                    if img_match:
+                        image_url = html_lib.unescape(img_match.group(1))
+
                 items.append(NewsItem(
                     source="reddit",
                     title=title,
@@ -60,7 +73,7 @@ class RedditCrawler(BaseCrawler):
                     author=author,
                     published_at=pub_date,
                     tags=tags,
-                    raw_data={"subreddit": sub_name},
+                    raw_data={"subreddit": sub_name, "image_url": image_url},
                 ))
 
-        return items
+        return self.filter_recent(items)

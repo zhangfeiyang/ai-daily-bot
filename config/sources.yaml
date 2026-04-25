@@ -5,8 +5,9 @@ arxiv:
     - cs.CL
     - cs.CV
     - cs.LG
-  max_results: 20
+  max_results: 30
   sort_by: submittedDate
+  max_age_hours: 96
 
 reddit:
   enabled: true
@@ -16,27 +17,72 @@ reddit:
     - ChatGPT
     - LocalLLaMA
   sort: hot
-  limit: 15
+  limit: 25
   time_filter: day
 
 twitter:
   enabled: true
   accounts:
+    # AI 公司官方
     - OpenAI
     - GoogleAI
     - AnthropicAI
     - GoogleDeepMind
+    - Grok
+    - zhipu_ai
+    - MiniMax_AI
+    - kimi_moonshot
+    - deepseek_ai
+    - THUDM
+    - Xiaomi
+    - XiaomiMimo
+    # AI 大佬个人账号
+    - elonmusk
+    - sama
     - ylecun
     - karpathy
-  limit: 20
+    - AndrewYNg
+    - goodfellow_ian
+    - hardmaru
+    - jeffdean
+    - sundarpichai
+    - demishassabis
+  limit: 30
+  filter_ai_only: true
   nitter_instances:
     - https://nitter.net
     - https://nitter.privacydev.net
-  accounts:
-    - OpenAI
-    - GoogleAI
-    - AnthropicAI
-    - GoogleDeepMind
-    - ylecun
-    - karpathy
-  limit: 20
+
+huggingface:
+  enabled: true
+  url: https://huggingface.co/papers
+  max_results: 25
+  max_age_hours: 96
+
+modelscope:
+  enabled: true
+  url: https://modelscope.cn/models
+  max_results: 20
+  max_age_hours: 48
+
+github:
+  enabled: true
+  languages:
+    - python
+  topics:
+    - machine-learning
+    - deep-learning
+    - llm
+  min_stars: 0
+  max_results: 25
+  max_age_hours: 96
+
+china_ai:
+  enabled: true
+  sources:
+    - quantumbit
+    - zhidx
+    - leiphone
+  filter_companies: true
+  max_results: 25
+  max_age_hours: 72
