@@ -78,11 +78,5 @@ github:
   max_age_hours: 96
 
 china_ai:
-  enabled: true
-  sources:
-    - quantumbit
-    - zhidx
-    - leiphone
-  filter_companies: true
-  max_results: 25
+  enabled: false
   max_age_hours: 72

@@ -27,10 +27,10 @@ def _render_info_card(rows: list[list[str]]) -> str:
     parts = []
     for i, cells in enumerate(rows):
         if len(cells) >= 2:
-            key = cells[0]
-            val = cells[1]
+            key = Pipeline._inline_md_to_html(cells[0])
+            val = Pipeline._inline_md_to_html(cells[1])
         else:
-            key, val = "", cells[0] if cells else ""
+            key, val = "", Pipeline._inline_md_to_html(cells[0]) if cells else ""
         parts.append(
             f'<span style="color:#888;font-size:13px;">{key}：</span>'
             f'<span style="color:#333;font-size:13px;">{val}</span>'
@@ -541,7 +541,7 @@ class Pipeline:
         return selected
 
     def _generate_single_article(self, item: NewsItem, date: str) -> str:
-        """为单条新闻生成深度文章 HTML。"""
+        """为单条新闻生成深度文章 HTML，并在段落间插入审核过的配图。"""
         feature_prompt = load_prompt(
             "feature",
             title=item.title,
@@ -554,48 +554,111 @@ class Pipeline:
         article_text = self.llm.generate(feature_prompt, item.content[:2000])
         article_html = self._markdown_to_html(article_text)
 
-        # Insert news image if available (priority: official > source)
-        image_inserted = False
-        if item.raw_data and item.raw_data.get("official_image"):
-            try:
-                img_html = self._download_and_upload_image(
-                    item.raw_data["official_image"], item.title
-                )
-                if img_html:
-                    h2_pos = article_html.find("</h2></section>")
-                    if h2_pos > 0:
-                        insert_pos = h2_pos + len("</h2></section>")
-                        article_html = (
-                            article_html[:insert_pos]
-                            + "\n" + img_html + "\n"
-                            + article_html[insert_pos:]
-                        )
-                    else:
-                        article_html = img_html + "\n" + article_html
-                    image_inserted = True
-            except Exception as e:
-                logger.warning(f"Failed to insert official image for '{item.title[:40]}': {e}")
+        # Collect candidate images: official_image > image_url
+        candidates = []
+        if item.raw_data:
+            if item.raw_data.get("official_image"):
+                candidates.append(item.raw_data["official_image"])
+            if item.raw_data.get("image_url") and item.raw_data["image_url"] not in candidates:
+                candidates.append(item.raw_data["image_url"])
 
-        if not image_inserted and item.raw_data and item.raw_data.get("image_url"):
+        # Upload candidates to WeChat and get permanent URLs
+        uploaded = []
+        for img_url in candidates:
             try:
-                img_html = self._download_and_upload_image(
-                    item.raw_data["image_url"], item.title
-                )
+                img_html = self._download_and_upload_image(img_url, item.title)
                 if img_html:
-                    h2_pos = article_html.find("</h2></section>")
-                    if h2_pos > 0:
-                        insert_pos = h2_pos + len("</h2></section>")
-                        article_html = (
-                            article_html[:insert_pos]
-                            + "\n" + img_html + "\n"
-                            + article_html[insert_pos:]
-                        )
-                    else:
-                        article_html = img_html + "\n" + article_html
+                    m = re.search(r'src="([^"]+)"', img_html)
+                    if m:
+                        uploaded.append(m.group(1))
             except Exception as e:
-                logger.warning(f"Failed to insert image for '{item.title[:40]}': {e}")
+                logger.debug(f"Failed to upload candidate image: {e}")
+
+        # Find h2 sections first
+        h2_pattern = r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>'
+        h2_matches = list(re.finditer(h2_pattern, article_html))
+
+        # If no candidate images, generate one per h2 section via API
+        if not uploaded and h2_matches and not self.debug:
+            for match in h2_matches[:3]:
+                section_title = re.sub(r'<[^>]+>', '', match.group(0)).strip()
+                try:
+                    gen_img_html = self._generate_section_image(section_title, item.content[:500])
+                    if gen_img_html:
+                        m = re.search(r'src="([^"]+)"', gen_img_html)
+                        if m:
+                            uploaded.append(m.group(1))
+                except Exception as e:
+                    logger.debug(f"Failed to generate image for section '{section_title[:30]}': {e}")
+
+        if not uploaded or not h2_matches:
+            return article_html
+
+        # Insert images after each h2 section, verified by vision model
+        img_idx = 0
+        insertions = []
+        for match in h2_matches:
+            if img_idx >= len(uploaded):
+                break
+
+            after_h2 = article_html[match.end():]
+            text_after = re.sub(r'<[^>]+>', '', after_h2[:500]).strip()[:300]
+            img_url = uploaded[img_idx]
+
+            # In debug mode, insert without vision verification
+            should_insert = True
+            if not self.debug:
+                should_insert = self._verify_image_for_section(img_url, text_after)
+
+            if should_insert:
+                img_html = (
+                    f'<section style="text-align:center;margin:12px 0;">'
+                    f'<img src="{img_url}" style="max-width:100%;border-radius:8px;" />'
+                    f'</section>'
+                )
+                insertions.append((match.end(), img_html))
+                img_idx += 1
+            else:
+                if img_idx + 1 < len(uploaded):
+                    next_url = uploaded[img_idx + 1]
+                    next_ok = True
+                    if not self.debug:
+                        next_ok = self._verify_image_for_section(next_url, text_after)
+                    if next_ok:
+                        img_html = (
+                            f'<section style="text-align:center;margin:12px 0;">'
+                            f'<img src="{next_url}" style="max-width:100%;border-radius:8px;" />'
+                            f'</section>'
+                        )
+                        insertions.append((match.end(), img_html))
+                        img_idx += 2
+
+        # Apply insertions in reverse order
+        for pos, img_html in sorted(insertions, reverse=True):
+            article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
+
+        if insertions:
+            logger.info(f"Inserted {len(insertions)} verified images in feature article")
 
         return article_html
+
+    def _verify_image_for_section(self, image_url: str, section_text: str) -> bool:
+        """用多模态模型审核图片是否适合当前段落内容。"""
+        try:
+            prompt = (
+                "你是一个微信公众号配图审核员。请判断这张图片是否适合作为以下段落内容的配图。\n\n"
+                "判断标准：\n"
+                "1. 图片内容是否与段落主题相关\n"
+                "2. 图片是否清晰、美观，适合在公众号展示\n"
+                "3. 图片不能是纯文字截图、logo、头像或占位图\n\n"
+                f"段落内容：{section_text[:200]}\n\n"
+                "只回复 YES 或 NO，不要其他内容。"
+            )
+            answer = self.llm.generate_with_images(prompt, section_text[:100], [image_url])
+            return answer.strip().upper().startswith("YES")
+        except Exception as e:
+            logger.debug(f"Image verification failed, accepting by default: {e}")
+            return True
 
     def _get_cover_for_item(self, item: NewsItem, today: str, index: int) -> str:
         """为单条新闻获取封面图。优先官方图片。"""
