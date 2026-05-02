@@ -111,18 +111,30 @@ class Segmenter:
         for i, para in enumerate(paragraphs):
             # 如果段落太长，按句号拆分
             if len(para) > 100:
-                sentences = re.split(r"[。！？]", para)
-                for j, sent in enumerate(sentences):
-                    if sent.strip() and len(sent.strip()) > 5:
+                # Use finditer to capture the delimiter positions
+                last_end = 0
+                for match in re.finditer(r"[。！？]", para):
+                    sent = para[last_end:match.start()].strip()
+                    if sent and len(sent) > 5:
                         segments.append(VideoSegment(
                             id=len(segments),
-                            text=sent.strip() + "。",
+                            text=sent + match.group(),  # Preserve original punctuation
                             segment_type=SegmentType.WITH_IMAGE,
                             image_prompt="AI technology abstract visualization"
                         ))
+                    last_end = match.end()
+                # Handle any remaining text after the last delimiter
+                remaining = para[last_end:].strip()
+                if remaining and len(remaining) > 5:
+                    segments.append(VideoSegment(
+                        id=len(segments),
+                        text=remaining + "。",  # Add period for text without ending punctuation
+                        segment_type=SegmentType.WITH_IMAGE,
+                        image_prompt="AI technology abstract visualization"
+                    ))
             else:
                 segments.append(VideoSegment(
-                    id=i,
+                    id=len(segments),
                     text=para,
                     segment_type=SegmentType.WITH_IMAGE,
                     image_prompt="AI technology abstract visualization"
