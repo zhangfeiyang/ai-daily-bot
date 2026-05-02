@@ -1,5 +1,4 @@
 # src/video/pipeline.py
-import os
 from pathlib import Path
 from loguru import logger
 
