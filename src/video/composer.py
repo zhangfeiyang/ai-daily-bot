@@ -94,11 +94,12 @@ class Composer:
 
     def _build_concat_command(self, clip_paths: list[Path], output_path: Path) -> list[str]:
         """构建拼接FFmpeg命令"""
-        # 创建concat文件列表
+        # 创建concat文件列表（使用绝对路径）
         concat_file = output_path.parent / "concat.txt"
         with open(concat_file, "w") as f:
             for clip in clip_paths:
-                f.write(f"file '{clip}'\n")
+                # 使用绝对路径避免FFmpeg concat路径问题
+                f.write(f"file '{clip.absolute()}'\n")
 
         return [
             "ffmpeg", "-y",
