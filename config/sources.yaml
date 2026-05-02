@@ -7,7 +7,7 @@ arxiv:
     - cs.LG
   max_results: 30
   sort_by: submittedDate
-  max_age_hours: 96
+  max_age_hours: 24
 
 reddit:
   enabled: true
@@ -19,9 +19,11 @@ reddit:
   sort: hot
   limit: 25
   time_filter: day
+  max_age_hours: 24
 
 twitter:
   enabled: true
+  max_age_hours: 24
   accounts:
     # AI 公司官方
     - OpenAI
@@ -36,6 +38,20 @@ twitter:
     - THUDM
     - Xiaomi
     - XiaomiMimo
+    # AI 工具 / Agent 项目
+    - anthropic
+    - claudecode
+    - Codex
+    - OpenClaude
+    - OpenClawAI
+    - LangChainAI
+    - LangChain
+    - AutoGPT
+    - CrewAIInc
+    - manus_ai
+    - DevinAI
+    - Replit
+    - Vercel
     # AI 大佬个人账号
     - elonmusk
     - sama
@@ -47,6 +63,12 @@ twitter:
     - jeffdean
     - sundarpichai
     - demishassabis
+    # 从媒体分析中发现的活跃账号 (2026-04)
+    - lifeof_jer        # AI研究者，Cursor相关
+    - teortaxesTex      # DeepSeek相关
+    - mitchellh         # Ghostty作者
+    - Reuters           # 科技新闻
+    - virushuo          # AI评论
   limit: 30
   filter_ai_only: true
   nitter_instances:
@@ -57,26 +79,38 @@ huggingface:
   enabled: true
   url: https://huggingface.co/papers
   max_results: 25
-  max_age_hours: 96
+  max_age_hours: 24
 
 modelscope:
   enabled: true
   url: https://modelscope.cn/models
   max_results: 20
-  max_age_hours: 48
+  max_age_hours: 24
 
 github:
   enabled: true
   languages:
     - python
+    - typescript
   topics:
-    - machine-learning
-    - deep-learning
     - llm
-  min_stars: 0
+    - ai-agent
+    - coding-assistant
+    - mcp
+    - rag
+    - vision-language-model
+    - autonomous-agent
+    - robotics
+  topic_limit: 5
+  min_stars: 50
   max_results: 25
-  max_age_hours: 96
+  max_age_hours: 24
 
 china_ai:
   enabled: false
-  max_age_hours: 72
+  sources: []
+  max_results: 15
+  max_age_hours: 24
+  per_page: 30
+  max_articles_per_source: 20
+  filter_companies: true

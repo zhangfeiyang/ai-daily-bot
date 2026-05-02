@@ -99,9 +99,9 @@ class Pipeline:
                 logger.warning("All items were already published, aborting")
                 return False
 
-            # 2.2 Hard freshness gate for daily runs.
+            # 2.2 Hard freshness gate for daily and feature runs.
             # Anything older than 24h should not enter selection at all.
-            if self.mode == "daily":
+            if self.mode in ("daily", "feature"):
                 before_fresh = len(all_items)
                 all_items = self._filter_fresh_items(all_items, max_hours=24)
                 fresh_filtered = before_fresh - len(all_items)
