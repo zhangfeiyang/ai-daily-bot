@@ -1,5 +1,4 @@
 import subprocess
-import tempfile
 from pathlib import Path
 from loguru import logger
 
@@ -14,6 +13,9 @@ class Composer:
 
     def compose(self, materials: list[VideoMaterial], segments: list[VideoSegment], output_path: Path) -> Path:
         """合成最终视频"""
+        if len(materials) != len(segments):
+            raise ValueError(f"Materials and segments must have the same length: {len(materials)} != {len(segments)}")
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         clips_dir = output_path.parent / "clips"
         clips_dir.mkdir(exist_ok=True)
