@@ -9,12 +9,19 @@ AI 科技新闻自动聚合与发布系统，每日自动爬取 AI 领域新闻�
 - **官方验证**：精选模式下，通过官网、微信公众号、官方推特、CEO 推特、模型负责人推特逐级验证新闻真实性，超过 24h 自动舍弃
 - **智能配图**：优先从官方来源抓取图表，其次使用 gpt-image-2 生成插图
 - **微信发布**：自动上传封面图和文章图片，创建草稿
+- **视频生成**：为文章自动生成讲解视频（PPT+配音形式）
 
 ## 运行模式
 
 ```bash
 # 每日快讯（10-15 条新闻汇总）
 python main.py daily
+
+# 真实跑批（保守源集，适合线上实跑）
+python main.py daily-live
+
+# 真实跑批时如需加回 arXiv
+DAILY_LIVE_INCLUDE_ARXIV=1 python main.py daily-live
 
 # 精选深度（Top 5 单篇深度文章，需官方验证）
 python main.py feature
@@ -56,6 +63,34 @@ export WECHAT_APP_SECRET=xxx
 
 或写入 `.env` 文件（已加入 .gitignore）。
 
+## 视频生成
+
+视频Pipeline可以自动为生成的文章创建讲解视频（PPT+配音形式）。
+
+### 启用方式
+
+```bash
+ENABLE_VIDEO_GENERATION=1 python main.py
+```
+
+### 功能特性
+
+- **LLM智能拆分**：根据文章语义自动拆分成适合视频的段落
+- **自动配图**：通过Codex为每个段落生成配图
+- **TTS配音**：使用edge-tts生成中文语音
+- **动态字幕**：字幕逐字显示，配合配音节奏
+- **FFmpeg合成**：输出标准MP4格式
+
+### 输出位置
+
+- 视频文件：`output/videos/{article_name}.mp4`
+- 临时素材：`output/videos/{article_name}/`
+
+### 依赖
+
+- FFmpeg（必须）
+- Codex CLI（可选，用于图片生成）
+
 ## 定时任务
 
 ```bash
@@ -63,6 +98,10 @@ bash setup_cron.sh
 ```
 
 每天 7:30 自动执行 daily 模式，每周日 10:00 执行 weekly 模式。
+
+当前 `feature` 也会在生成完成后自动把当天的 `feature_YYYY-MM-DD_*.html` 上传到公众号草稿箱，适合直接人工复审后再发。
+
+如果你希望只先生成不进草稿箱，继续用 `--debug`，或者手动执行 `python main.py draft <article.html>`。
 
 ## 项目结构
 
