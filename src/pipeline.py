@@ -1120,6 +1120,17 @@ class Pipeline:
                 chinese_title = self._generate_chinese_title_from_article(article_html, item.title)
                 logger.info(f"  Title: {chinese_title}")
 
+                # ── 综合审查循环 ──
+                article_html, chinese_title, review_log = self._review_and_fix_article(
+                    article_html, chinese_title, item
+                )
+                logger.info(
+                    f"  Review: {review_log['iterations']} iteration(s), "
+                    f"title_issues={len(review_log['title_issues'])}, "
+                    f"content_issues={len(review_log['content_issues'])}, "
+                    f"image_duplicates={len(review_log['image_duplicates'])}"
+                )
+
                 # Cover image: priority official_image > news image > default
                 thumb_media_id = ""
                 if not self.debug:
