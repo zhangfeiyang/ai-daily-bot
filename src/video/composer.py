@@ -1,4 +1,5 @@
 import subprocess
+import shutil
 from pathlib import Path
 from loguru import logger
 
@@ -27,9 +28,9 @@ class Composer:
 
             try:
                 if mat.image_path and mat.image_path.exists():
-                    self._create_image_clip(mat, seg, clip_path)
+                    self._create_image_clip(mat, seg, clip_path, clips_dir)
                 else:
-                    self._create_text_clip(mat, seg, clip_path)
+                    self._create_text_clip(mat, seg, clip_path, clips_dir)
 
                 clip_paths.append(clip_path)
                 logger.info(f"Created clip {seg.id}")
@@ -46,82 +47,106 @@ class Composer:
 
         return output_path
 
-    def _create_text_clip(self, material: VideoMaterial, segment: VideoSegment, output_path: Path) -> None:
+    def _create_text_clip(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> None:
         """创建纯文字视频片段"""
-        cmd = self._build_text_clip_command(material, segment, output_path)
-        self._run_ffmpeg(cmd)
+        cmd = self._build_text_clip_command(material, segment, output_path, work_dir)
+        self._run_ffmpeg(cmd, work_dir)
 
-    def _create_image_clip(self, material: VideoMaterial, segment: VideoSegment, output_path: Path) -> None:
+    def _create_image_clip(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> None:
         """创建配图视频片段"""
-        cmd = self._build_image_clip_command(material, segment, output_path)
-        self._run_ffmpeg(cmd)
+        cmd = self._build_image_clip_command(material, segment, output_path, work_dir)
+        self._run_ffmpeg(cmd, work_dir)
 
-    def _build_text_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path) -> list[str]:
+    def _build_text_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> list[str]:
         """构建纯文字片段FFmpeg命令"""
         duration = segment.duration or 5.0
-        text = segment.text.replace("'", "'\\''")  # 转义单引号
+        text_file = work_dir / f"text_{segment.id}.txt"
+        text_file.write_text(segment.text, encoding="utf-8")
 
         # 使用drawtext滤镜显示文字
         return [
             "ffmpeg", "-y",
             "-f", "lavfi",
             "-i", f"color=c=white:s={self.config.video_width}x{self.config.video_height}:d={duration}",
-            "-i", str(material.audio_path),
-            "-vf", f"drawtext=text='{text}':fontsize={self.config.subtitle_fontsize}:fontcolor=black:x=(w-text_w)/2:y=(h-text_h)/2",
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-t", str(duration),
-            str(output_path)
-        ]
-
-    def _build_image_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path) -> list[str]:
-        """构建配图片段FFmpeg命令"""
-        duration = segment.duration or 5.0
-
-        # 图片缩放 + 音频 + 字幕
-        return [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-i", str(material.image_path),
-            "-i", str(material.audio_path),
-            "-vf", f"scale={self.config.video_width}:{self.config.video_height}:force_original_aspect_ratio=decrease,pad={self.config.video_width}:{self.config.video_height}:(ow-iw)/2:(oh-ih)/2,subtitles={str(material.subtitle_srt)}:force_style='FontName={self.config.subtitle_font},FontSize={self.config.subtitle_fontsize},PrimaryColour=&H{self._color_to_ass(self.config.subtitle_color)},OutlineColour=&H000000,BackColour=&H{self._color_to_ass_bg(self.config.subtitle_bg)}'",
+            "-i", str(material.audio_path.absolute()),
+            "-vf", (
+                f"drawtext=textfile={text_file.absolute()}:"
+                f"fontsize={self.config.subtitle_fontsize}:"
+                "fontcolor=black:x=(w-text_w)/2:y=(h-text_h)/2:"
+                "box=1:boxcolor=white@0.75:boxborderw=24"
+            ),
             "-c:v", "libx264",
             "-c:a", "aac",
             "-t", str(duration),
             "-pix_fmt", "yuv420p",
-            str(output_path)
+            str(output_path.absolute())
+        ]
+
+    def _build_image_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> list[str]:
+        """构建配图片段FFmpeg命令"""
+        duration = segment.duration or 5.0
+        subtitle_path = work_dir / f"clip_{segment.id}.srt"
+        if material.subtitle_srt != subtitle_path:
+            shutil.copy2(material.subtitle_srt, subtitle_path)
+
+        # 图片缩放 + 音频 + 字幕（使用绝对路径）
+        return [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(material.image_path.absolute()),
+            "-i", str(material.audio_path.absolute()),
+            "-vf", (
+                f"scale={self.config.video_width}:{self.config.video_height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.config.video_width}:{self.config.video_height}:(ow-iw)/2:(oh-ih)/2,"
+                f"subtitles={subtitle_path.absolute()}:"
+                f"force_style='FontName={self.config.subtitle_font},FontSize={self.config.subtitle_fontsize},"
+                f"PrimaryColour=&H{self._color_to_ass(self.config.subtitle_color)},"
+                "OutlineColour=&H000000,BorderStyle=4,"
+                f"BackColour=&H{self._color_to_ass_bg(self.config.subtitle_bg)}'"
+            ),
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-t", str(duration),
+            "-pix_fmt", "yuv420p",
+            str(output_path.absolute())
         ]
 
     def _build_concat_command(self, clip_paths: list[Path], output_path: Path) -> list[str]:
         """构建拼接FFmpeg命令"""
         # 创建concat文件列表（使用绝对路径）
-        concat_file = output_path.parent / "concat.txt"
+        concat_file = clip_paths[0].parent / "concat.txt"
         with open(concat_file, "w") as f:
             for clip in clip_paths:
-                # 使用绝对路径避免FFmpeg concat路径问题
-                f.write(f"file '{clip.absolute()}'\n")
+                f.write(f"file '{self._escape_concat_path(clip.absolute())}'\n")
 
         return [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
-            "-i", str(concat_file),
-            "-c", "copy",
-            str(output_path)
+            "-i", str(concat_file.absolute()),
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-pix_fmt", "yuv420p",
+            str(output_path.absolute())
         ]
 
     def _concat_clips(self, clip_paths: list[Path], output_path: Path) -> None:
         """拼接视频片段"""
         cmd = self._build_concat_command(clip_paths, output_path)
-        self._run_ffmpeg(cmd)
+        self._run_ffmpeg(cmd, clip_paths[0].parent)
 
-    def _run_ffmpeg(self, cmd: list[str]) -> None:
+    def _run_ffmpeg(self, cmd: list[str], work_dir: Path) -> None:
         """执行FFmpeg命令"""
         logger.debug(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(work_dir))
         if result.returncode != 0:
             logger.error(f"FFmpeg error: {result.stderr}")
             raise RuntimeError(f"FFmpeg failed: {result.stderr[:500]}")
+
+    def _escape_concat_path(self, path: Path | str) -> str:
+        """Escape a filesystem path for FFmpeg concat demuxer list files."""
+        path_text = path.as_posix() if isinstance(path, Path) else path
+        return path_text.replace("\\", "\\\\").replace("'", "\\'")
 
     def _color_to_ass(self, color: str) -> str:
         """将颜色名称转换为ASS格式（BGR）"""

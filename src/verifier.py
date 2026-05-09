@@ -38,13 +38,19 @@ class NewsVerifier:
         return index
 
     def identify_company(self, title: str, content: str) -> str | None:
-        """从新闻标题和内容识别涉及的公司（关键词匹配）。"""
-        text = (title + " " + content[:500]).lower()
+        """从新闻标题和内容识别涉及的公司（关键词匹配）。
+
+        标题中的关键词权重更高（×3），避免正文偶然提及导致误判。
+        """
+        title_lower = title.lower()
+        content_lower = content[:500].lower()
 
         best_company = None
         best_score = 0
         for company_key, keywords in self._company_keywords:
-            score = sum(1 for kw in keywords if kw.lower() in text)
+            title_score = sum(3 for kw in keywords if kw.lower() in title_lower)
+            content_score = sum(1 for kw in keywords if kw.lower() in content_lower)
+            score = title_score + content_score
             if score > best_score:
                 best_score = score
                 best_company = company_key
@@ -55,6 +61,10 @@ class NewsVerifier:
         """验证新闻的官方来源，按优先级逐级尝试。"""
         company = self.identify_company(item.title, item.content)
         if not company:
+            # 对于没有识别出公司的内容，检查是否为高质量讨论帖
+            if self._is_quality_discussion(item):
+                logger.info(f"Quality discussion (no company needed): {item.title[:50]}")
+                return {"verified": True, "reason": "quality_discussion", "source": "social"}
             logger.info(f"No company identified for: {item.title[:50]}")
             return {"verified": False, "reason": "no_company"}
 
@@ -83,6 +93,81 @@ class NewsVerifier:
         logger.info(f"Could not verify official source for: {item.title[:50]}")
         return {"verified": False, "reason": "not_found"}
 
+    def _is_quality_discussion(self, item) -> bool:
+        """判断是否为高质量的AI相关讨论帖（不需要公司验证）。"""
+        title = item.title.strip()
+        content = (item.content or "").strip()
+        source = item.source.lower()
+        combined_text = (title + " " + content).lower()
+
+        # 必须与AI相关，否则直接拒绝
+        ai_keywords = [
+            "ai", "artificial intelligence", "machine learning", "ml", "llm",
+            "gpt", "chatgpt", "claude", "gemini", "deepseek", "qwen", "kimi",
+            "openai", "anthropic", "google ai", "meta ai", "mistral",
+            "neural", "transformer", "diffusion", "language model",
+            "agent", "agentic", "mcp", "cursor", "copilot", "codex",
+            "人工智能", "大模型", "机器学习", "深度学习", "智能体",
+            "自动化", "算法", "神经网络",
+        ]
+        has_ai_keyword = any(kw in combined_text for kw in ai_keywords)
+        if not has_ai_keyword:
+            return False
+
+        # 排除低质量内容
+        low_quality_keywords = [
+            "meme", "funny", "joke", "lol", "haha", "low effort",
+            "just", "yup", "yes", "no", "maybe", "ok", "nice",
+        ]
+        if any(kw in title.lower() for kw in low_quality_keywords):
+            return False
+
+        # 标题太短（少于10个字符）
+        if len(title) < 10:
+            return False
+
+        # 内容太短（少于100字符）
+        if len(content) < 100:
+            return False
+
+        # Reddit 高质量讨论：高互动、有深度
+        if source == "reddit":
+            # 检查是否有足够的讨论内容
+            if len(content) >= 300:
+                return True
+
+        # Twitter/X 高质量帖子：有实质内容
+        if source in ("twitter", "x"):
+            # 排除纯转发（以 RT 开头，但允许回复 R to）
+            if title.startswith("RT ") or title.startswith("RT by "):
+                return False
+            # 回复帖（R to @username）如果有实质内容也通过
+            if title.startswith("R to @") or title.startswith("R by @"):
+                if len(content) >= 200:
+                    return True
+            # 普通帖子有实质内容
+            if len(content) >= 200:
+                return True
+
+        # HuggingFace 论文讨论
+        if "huggingface" in source:
+            if len(content) >= 200:
+                return True
+
+        # 行业分析/观点类内容
+        analysis_keywords = [
+            "analysis", "insight", "perspective", "opinion", "essay",
+            "分析", "观点", "洞察", "思考", "解读",
+            "future", "trend", "impact", "implication",
+            "未来", "趋势", "影响",
+            "major essay", "deep dive", "thread", "newsletter",
+        ]
+        if any(kw in title.lower() or kw in content.lower()[:500] for kw in analysis_keywords):
+            if len(content) >= 200:
+                return True
+
+        return False
+
     # ---- 策略 1: 官方网站 ----
 
     def _search_official_website(self, item, cfg: dict, company: str) -> dict:
@@ -93,9 +178,19 @@ class NewsVerifier:
             return {"verified": False}
 
         search_query = self._build_search_query(item, company)
-        site_query = f"site:{self._extract_domain(blog)} {search_query}"
+        domain = self._extract_domain(blog)
 
+        # 先尝试 site: 搜索
+        site_query = f"site:{domain} {search_query}"
         results = self._web_search(site_query, max_results=3)
+
+        # site: 搜索失败时，尝试通用搜索并匹配域名
+        if not results:
+            results = self._web_search(search_query, max_results=5)
+            if results:
+                domain_lower = domain.lower()
+                results = [r for r in results if domain_lower in r.get("url", "").lower()]
+
         if results:
             best = results[0]
             images = self._fetch_page_images(best.get("url", ""))
@@ -197,7 +292,7 @@ class NewsVerifier:
                 "verified": True,
                 "source": "direct",
                 "official_url": item.url,
-                "official_image": item.raw_data.get("image_url", ""),
+                "official_image": item.raw_data.get("image_url", "") if item.raw_data else "",
                 "publish_time": item.published_at.isoformat() if item.published_at else "",
             }
 
@@ -206,20 +301,64 @@ class NewsVerifier:
                 "verified": True,
                 "source": "direct",
                 "official_url": item.url,
-                "official_image": item.raw_data.get("image_url", ""),
+                "official_image": item.raw_data.get("image_url", "") if item.raw_data else "",
                 "publish_time": item.published_at.isoformat() if item.published_at else "",
             }
 
-        # Twitter 官方账号
+        # Twitter 官方账号（支持 x.com 和 nitter.net）
         twitter = cfg.get("twitter", "").lower()
-        if twitter and f"x.com/{twitter}" in url:
-            return {
-                "verified": True,
-                "source": "twitter_direct",
-                "official_url": item.url,
-                "official_image": item.raw_data.get("image_url", ""),
-                "publish_time": item.published_at.isoformat() if item.published_at else "",
-            }
+        if twitter:
+            twitter_patterns = [
+                f"x.com/{twitter}",
+                f"nitter.net/{twitter}",
+                f"nitter.privacydev.net/{twitter}",
+                f"nitter.poast.org/{twitter}",
+            ]
+            if any(p in url for p in twitter_patterns):
+                return {
+                    "verified": True,
+                    "source": "twitter_direct",
+                    "official_url": item.url,
+                    "official_image": item.raw_data.get("image_url", "") if item.raw_data else "",
+                    "publish_time": item.published_at.isoformat() if item.published_at else "",
+                }
+
+        # 子品牌 Twitter
+        for sub_key, sub_cfg in cfg.get("sub_brands", {}).items():
+            sub_twitter = sub_cfg.get("twitter", "").lower()
+            if sub_twitter:
+                sub_patterns = [
+                    f"x.com/{sub_twitter}",
+                    f"nitter.net/{sub_twitter}",
+                    f"nitter.privacydev.net/{sub_twitter}",
+                    f"nitter.poast.org/{sub_twitter}",
+                ]
+                if any(p in url for p in sub_patterns):
+                    return {
+                        "verified": True,
+                        "source": "twitter_direct",
+                        "official_url": item.url,
+                        "official_image": item.raw_data.get("image_url", "") if item.raw_data else "",
+                        "publish_time": item.published_at.isoformat() if item.published_at else "",
+                    }
+
+        # CEO Twitter
+        ceo_twitter = cfg.get("ceo_twitter", "").lower()
+        if ceo_twitter:
+            ceo_patterns = [
+                f"x.com/{ceo_twitter}",
+                f"nitter.net/{ceo_twitter}",
+                f"nitter.privacydev.net/{ceo_twitter}",
+                f"nitter.poast.org/{ceo_twitter}",
+            ]
+            if any(p in url for p in ceo_patterns):
+                return {
+                    "verified": True,
+                    "source": "ceo_twitter_direct",
+                    "official_url": item.url,
+                    "official_image": item.raw_data.get("image_url", "") if item.raw_data else "",
+                    "publish_time": item.published_at.isoformat() if item.published_at else "",
+                }
 
         return {"verified": False}
 
@@ -230,13 +369,25 @@ class NewsVerifier:
     ) -> dict:
         """在指定推特账号中搜索相关推文。"""
         search_query = self._build_search_query(item, company)
-        site_query = f"site:x.com/{account} {search_query}"
 
+        # 先尝试 x.com 搜索
+        site_query = f"site:x.com/{account} {search_query}"
         results = self._web_search(site_query, max_results=3)
+
+        # 如果 x.com 搜索失败，尝试 nitter.net
+        if not results:
+            site_query = f"site:nitter.net/{account} {search_query}"
+            results = self._web_search(site_query, max_results=3)
+
+        # 仍然失败，用通用搜索并匹配账号
+        if not results:
+            results = self._web_search(f"{account} {search_query}", max_results=5)
+            if results:
+                results = [r for r in results if account.lower() in r.get("url", "").lower()]
+
         if results:
             best = results[0]
             tweet_url = best.get("url", "")
-            # 尝试从推特页面抓取图片
             images = self._fetch_tweet_images(tweet_url)
             return {
                 "verified": True,
@@ -344,14 +495,27 @@ class NewsVerifier:
 
     # ---- 新鲜度检查 ----
 
-    def check_freshness(self, publish_time: str, max_hours: int = 24) -> bool:
-        """检查官方消息是否在指定小时数内。无时间信息时不通过。"""
+    def check_freshness(self, publish_time: str, max_hours: int = 24, item_published_at=None) -> bool:
+        """检查官方消息是否在指定小时数内。
+
+        优先使用官方验证返回的 publish_time，如果为空则回退到
+        新闻条目自身的 published_at（爬虫已解析的时间戳）。
+        """
         if not publish_time:
-            # 没有时间信息，保守拒绝
-            logger.info("Freshness check: no publish_time, rejecting")
-            return False
+            # 官方验证未返回时间，尝试使用条目自带的时间
+            if item_published_at:
+                publish_time = item_published_at.isoformat() if hasattr(item_published_at, 'isoformat') else str(item_published_at)
+                logger.debug(f"Freshness: using item published_at as fallback: {publish_time}")
+            else:
+                # 完全没有时间信息，默认通过（今天爬到的内容本身就是新鲜的）
+                logger.info("Freshness check: no time info at all, accepting (today's crawl)")
+                return True
 
         try:
+            # Strip microseconds from isoformat (e.g. 2026-04-28T21:53:15.345106+00:00)
+            import re as _re
+            publish_time = _re.sub(r'\.\d+', '', publish_time.strip())
+
             for fmt in [
                 "%Y-%m-%dT%H:%M:%S%z",
                 "%Y-%m-%dT%H:%M:%S",

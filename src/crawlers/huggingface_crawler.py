@@ -31,15 +31,37 @@ class HuggingFaceCrawler(BaseCrawler):
         soup = BeautifulSoup(resp.text, "html.parser")
         items = []
 
-        # HuggingFace papers 页面结构
-        paper_cards = soup.select("article.paper-card, div.paper-card, [data-paper-id]") or \
-                      soup.select("a[href^='/papers/']")
+        # HuggingFace papers 页面结构：每篇论文有 article 元素
+        # 在 article 内部，h3 包含标题，h3 > a 包含论文链接
+        paper_articles = soup.select("article")
 
-        for card in paper_cards[:max_results]:
+        seen_urls = set()
+        for article in paper_articles:
             try:
-                item = self._parse_paper(card, soup)
+                # 查找 h3 中的论文链接（这是标题链接）
+                title_link = article.select_one("h3 > a[href^='/papers/']")
+                if not title_link:
+                    continue
+
+                href = title_link.get("href", "")
+                # 过滤非论文链接和重复链接
+                if not re.match(r'^/papers/\d{4}\.\d{4,5}', href):
+                    continue
+                if href in seen_urls:
+                    continue
+                seen_urls.add(href)
+
+                # 获取标题
+                title = title_link.get_text(strip=True)
+                if not title:
+                    continue
+
+                item = self._create_news_item(title, href, article)
                 if item:
                     items.append(item)
+
+                if len(items) >= max_results:
+                    break
             except Exception as e:
                 logger.debug(f"HuggingFace: failed to parse paper: {e}")
                 continue
@@ -50,23 +72,57 @@ class HuggingFaceCrawler(BaseCrawler):
 
         return self.filter_recent(items)
 
+    def _create_news_item(self, title: str, href: str, article) -> NewsItem | None:
+        """创建 NewsItem 对象。"""
+        url = f"https://huggingface.co{href}"
+
+        # 获取摘要
+        abstract_elem = article.select_one(".abstract, [class*='abstract'], p")
+        content = abstract_elem.get_text(strip=True)[:2000] if abstract_elem else title
+
+        # 获取作者
+        authors_elem = article.select_one(".authors, [class*='author']")
+        author = authors_elem.get_text(strip=True) if authors_elem else "HuggingFace"
+
+        # 尝试提取 arxiv ID 获取图片
+        arxiv_id = self._extract_arxiv_id(url, article)
+        image_url = ""
+        if arxiv_id:
+            image_url = self._get_arxiv_figure(arxiv_id)
+
+        return NewsItem(
+            source="huggingface",
+            title=title,
+            url=url,
+            content=content,
+            author=author,
+            published_at=datetime.now(timezone.utc),
+            tags=["paper", "huggingface"],
+            raw_data={"arxiv_id": arxiv_id, "image_url": image_url},
+        )
+
     def _parse_paper(self, card, soup) -> NewsItem | None:
-        """解析单个论文卡片。"""
-        # 获取标题和链接
-        title_elem = card.select_one("h3, h2, .paper-title, [class*='title']")
+        """解析单个论文卡片（备用方法）。"""
+        # 获取链接
         link_elem = card.select_one("a[href^='/papers/']") or card
-
-        if not title_elem and link_elem:
-            title_elem = link_elem
-
-        if not title_elem:
-            return None
-
-        title = title_elem.get_text(strip=True)
         href = link_elem.get("href", "") if link_elem else ""
 
-        if not title or not href:
+        # 过滤掉非论文链接（如导航链接）
+        if not re.match(r'^/papers/\d{4}\.\d{4,5}', href):
             return None
+
+        # 获取标题：优先查找标题元素，否则从链接文本获取
+        title_elem = card.select_one("h3, h2, .paper-title, [class*='title']")
+        if title_elem:
+            title = title_elem.get_text(strip=True)
+        else:
+            # 从页面中查找对应的标题
+            title = self._find_paper_title(soup, href)
+
+        if not title:
+            # 从 URL 提取 arxiv ID 作为标题
+            arxiv_id = href.split("/")[-1] if "/" in href else ""
+            title = f"Paper: {arxiv_id}"
 
         if href.startswith("/"):
             url = f"https://huggingface.co{href}"
@@ -97,6 +153,18 @@ class HuggingFaceCrawler(BaseCrawler):
             tags=["paper", "huggingface"],
             raw_data={"arxiv_id": arxiv_id, "image_url": image_url},
         )
+
+    def _find_paper_title(self, soup, href: str) -> str:
+        """从页面中查找论文标题。"""
+        # 查找指向该论文的链接，获取其完整文本
+        link = soup.select_one(f"a[href='{href}']")
+        if link:
+            # 获取链接的完整文本内容
+            text = link.get_text(strip=True)
+            # 如果文本看起来像标题（长度合理且不是作者信息）
+            if text and len(text) > 20 and not text.startswith("·") and not text.isdigit():
+                return text
+        return ""
 
     def _parse_papers_fallback(self, html: str, max_results: int) -> list[NewsItem]:
         """备用解析方法：从页面中提取论文链接。"""

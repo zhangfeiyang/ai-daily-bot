@@ -10,7 +10,9 @@ class TestMaterialGenerator:
     def test_generate_audio_for_segment(self, tmp_path):
         """测试为段落生成音频"""
         tts_engine = Mock()
-        tts_engine.generate.return_value = str(tmp_path / "audio.mp3")
+        expected_audio = tmp_path / "segment_1.mp3"
+        expected_audio.write_bytes(b"fake audio")
+        tts_engine.generate.return_value = str(expected_audio)
 
         image_gen = Mock()
 
@@ -21,6 +23,18 @@ class TestMaterialGenerator:
 
         assert audio_path == tmp_path / "segment_1.mp3"
         tts_engine.generate.assert_called_once_with("测试文本", str(tmp_path / "segment_1.mp3"))
+
+    def test_generate_audio_requires_output_file(self, tmp_path):
+        """测试TTS没有生成文件时抛出明确错误"""
+        tts_engine = Mock()
+        tts_engine.generate.return_value = str(tmp_path / "missing.mp3")
+        image_gen = Mock()
+
+        generator = MaterialGenerator(tts_engine, image_gen)
+        segment = VideoSegment(id=1, text="测试文本", segment_type=SegmentType.TEXT_ONLY, image_prompt=None)
+
+        with pytest.raises(RuntimeError, match="TTS did not create audio file"):
+            generator._generate_audio(segment, tmp_path)
 
     def test_generate_image_for_segment(self, tmp_path):
         """测试为段落生成图片"""
@@ -69,7 +83,11 @@ class TestMaterialGenerator:
     def test_generate_all_materials(self, tmp_path):
         """测试生成所有素材"""
         tts_engine = Mock()
-        tts_engine.generate.return_value = str(tmp_path / "audio.mp3")
+        def fake_tts(text, output_path):
+            Path(output_path).write_bytes(b"fake audio")
+            return output_path
+
+        tts_engine.generate.side_effect = fake_tts
 
         image_gen = Mock()
         image_gen.generate.return_value = tmp_path / "image.png"

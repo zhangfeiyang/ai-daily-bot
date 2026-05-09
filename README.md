@@ -38,6 +38,9 @@ python main.py test
 
 # 手动标记已发布（关键词去重）
 python main.py mark-published 2026-04-25
+
+# 基于已有文章生成视频
+python main.py video output/articles/daily_2026-05-03.html
 ```
 
 ## 配置
@@ -70,7 +73,11 @@ export WECHAT_APP_SECRET=xxx
 ### 启用方式
 
 ```bash
-ENABLE_VIDEO_GENERATION=1 python main.py
+# 跑 daily/daily-live/feature 后自动为新文章生成视频
+ENABLE_VIDEO_GENERATION=1 python main.py daily-live
+
+# 或者基于已有文章手动生成
+python main.py video output/articles/daily_2026-05-03.html
 ```
 
 ### 功能特性

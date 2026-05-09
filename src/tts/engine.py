@@ -14,8 +14,8 @@ class TTSEngine:
         self.rate = tts_config.get("rate", "+0%")
         self.output_format = tts_config.get("output_format", "mp3")
 
-    def generate(self, text: str, output_path: str) -> list[str]:
-        """Generate TTS audio. Returns list of audio file paths.
+    def generate(self, text: str, output_path: str) -> str | list[str]:
+        """Generate TTS audio.
 
         If the total audio exceeds WeChat's 2MB limit, it is automatically
         split into multiple files each under the limit.
@@ -53,7 +53,7 @@ class TTSEngine:
                         out.write(f.read())
                     Path(cp).unlink()
             logger.info(f"TTS audio saved to {output_path}")
-            return [output_path]
+            return output_path
 
         # Split: accumulate chunks into parts, each ≤ 2MB
         parts: list[str] = []

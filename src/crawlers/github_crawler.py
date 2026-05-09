@@ -14,6 +14,9 @@ class GitHubCrawler(BaseCrawler):
 
     def fetch(self) -> list[NewsItem]:
         topics = self.config.get("topics", ["machine-learning", "deep-learning", "llm"])
+        topic_limit = self.config.get("topic_limit")
+        if topic_limit:
+            topics = topics[: int(topic_limit)]
         languages = self.config.get("languages", ["python"])
         min_stars = self.config.get("min_stars", 5)
         max_results = self.config.get("max_results", 20)
@@ -77,11 +80,15 @@ class GitHubCrawler(BaseCrawler):
         language = repo.get("language", "") or ""
         topics = repo.get("topics", [])
 
+        # Filter out repos without meaningful description
+        if not description or len(description.strip()) < 10:
+            return None
+
         tags = ["github"] + [t for t in topics if t][:3]
         if language:
             tags.append(language.lower())
 
-        title = f"{repo_name}: {description[:80]}" if description else repo_name
+        title = f"{repo_name}({stars}⭐): {description[:70]}" if description else repo_name
 
         # GitHub social preview image
         image_url = f"https://opengraph.githubassets.com/1/{full_name}"

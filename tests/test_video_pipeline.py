@@ -18,7 +18,11 @@ class TestVideoPipeline:
         }'''
 
         tts_engine = Mock()
-        tts_engine.generate.return_value = str(tmp_path / "audio.mp3")
+        def fake_tts(text, output_path):
+            Path(output_path).write_bytes(b"fake audio")
+            return output_path
+
+        tts_engine.generate.side_effect = fake_tts
 
         image_gen = Mock()
         image_gen.generate.return_value = tmp_path / "image.png"

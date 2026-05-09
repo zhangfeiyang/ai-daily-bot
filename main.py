@@ -1,5 +1,9 @@
 # main.py
 import sys
+import time
+from pathlib import Path
+import re
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 from src.config import load_config
 from src.crawlers.arxiv_crawler import ArxivCrawler
@@ -13,6 +17,23 @@ from src.llm.client import LLMClient
 from src.pipeline import Pipeline
 from src.publish.wechat import WeChatPublisher
 from src.verifier import NewsVerifier
+
+
+def _retry_call(func, *args, max_retries: int = 3, delay: float = 5.0, **kwargs):
+    """Retry a function call with exponential backoff."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait = delay * (2 ** attempt)
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+            else:
+                logger.error(f"All {max_retries} attempts failed: {e}")
+    raise last_error
 
 
 def setup_logging():
@@ -43,6 +64,102 @@ def build_crawlers(sources_config: dict) -> list:
     if sources_config.get("china_ai", {}).get("enabled", False):
         crawlers.append(ChinaAICrawler(sources_config["china_ai"]))
     return crawlers
+
+
+def build_live_crawlers(sources_config: dict) -> list:
+    """Build a conservative source set for real daily runs.
+
+    Default to the most stable source. Extra sources can be enabled with env vars:
+    - DAILY_LIVE_INCLUDE_ARXIV=1
+    """
+    import os
+
+    crawlers = []
+    if sources_config.get("github", {}).get("enabled", False):
+        crawlers.append(GitHubCrawler(sources_config["github"]))
+    if os.environ.get("DAILY_LIVE_INCLUDE_ARXIV") == "1" and sources_config.get("arxiv", {}).get("enabled", False):
+        crawlers.append(ArxivCrawler(sources_config["arxiv"]))
+    return crawlers
+
+
+def _extract_article_title_from_html(html: str, fallback: str = "") -> str:
+    match = re.search(r"<!--\s*ARTICLE_TITLE:\s*(.*?)\s*-->", html, flags=re.S)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.S | re.I)
+    if match:
+        title = re.sub(r"<[^>]+>", "", match.group(1))
+        title = re.sub(r"\s+", " ", title).strip()
+        if title:
+            return title
+    return fallback
+
+
+def _extract_thumb_media_id_from_html(html: str) -> str:
+    match = re.search(r"<!--\s*THUMB_MEDIA_ID:\s*(.*?)\s*-->", html, flags=re.S)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _upload_daily_draft(publisher: WeChatPublisher) -> bool:
+    """Upload today's staged daily article to the WeChat draft box."""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y-%m-%d")
+    article_file = Path(f"output/articles/daily_{today}.html")
+    if not article_file.exists():
+        logger.error(f"No staged daily article found for {today}")
+        return False
+
+    try:
+        html = article_file.read_text(encoding="utf-8")
+        title = _extract_article_title_from_html(html, fallback=article_file.stem)
+        thumb_media_id = _extract_thumb_media_id_from_html(html)
+        media_id = _retry_call(
+            publisher.create_draft,
+            title=title,
+            content=html,
+            thumb_media_id=thumb_media_id,
+            max_retries=3,
+            delay=5.0,
+        )
+        logger.info(f"Daily draft uploaded from {article_file} -> {media_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upload daily draft {article_file}: {e}")
+        return False
+
+
+def _upload_feature_drafts(publisher: WeChatPublisher) -> bool:
+    """Upload today's staged feature articles to the WeChat draft box."""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y-%m-%d")
+    article_files = sorted(Path("output/articles").glob(f"feature_{today}_*.html"))
+    if not article_files:
+        logger.error(f"No staged feature articles found for {today}")
+        return False
+
+    ok = False
+    for article_file in article_files:
+        try:
+            html = article_file.read_text(encoding="utf-8")
+            title = _extract_article_title_from_html(html, fallback=article_file.stem)
+            thumb_media_id = _extract_thumb_media_id_from_html(html)
+            media_id = _retry_call(
+                publisher.create_draft,
+                title=title,
+                content=html,
+                thumb_media_id=thumb_media_id,
+                max_retries=3,
+                delay=5.0,
+            )
+            logger.info(f"Feature draft uploaded from {article_file} -> {media_id}")
+            ok = True
+        except Exception as e:
+            logger.error(f"Failed to upload feature draft {article_file}: {e}")
+            return False
+
+    return ok
 
 
 def mark_published():
@@ -86,9 +203,9 @@ def mark_published():
 
 
 def main():
-    valid_modes = ("daily", "weekly", "test", "mark-published", "feature")
+    valid_modes = ("daily", "daily-live", "weekly", "test", "mark-published", "feature", "draft", "video")
     if len(sys.argv) < 2 or sys.argv[1] not in valid_modes:
-        print("Usage: python main.py <daily|weekly|test|feature|mark-published [date]>")
+        print("Usage: python main.py <daily|daily-live|weekly|test|feature|draft|video|mark-published [date]>")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -100,13 +217,67 @@ def main():
     setup_logging()
     logger.info(f"Starting pipeline in '{mode}' mode")
 
+    if mode == "video":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py video <article.html> [more.html...]")
+            sys.exit(1)
+
+        from src.video.pipeline import VideoPipeline
+        pipeline = VideoPipeline.from_config()
+        ok = False
+        for article_file in [Path(arg) for arg in sys.argv[2:]]:
+            if not article_file.exists():
+                logger.error(f"Video source not found: {article_file}")
+                continue
+            result = pipeline.generate(article_file)
+            if result and result.exists():
+                logger.info(f"Video generated from {article_file}: {result}")
+                ok = True
+            else:
+                logger.error(f"Video generation failed for {article_file}")
+
+        if not ok:
+            sys.exit(1)
+        return
+
+    if mode == "draft":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py draft <article.html> [more.html...]")
+            sys.exit(1)
+
+        wechat_config = load_config("wechat")
+        publisher = WeChatPublisher(wechat_config)
+        article_files = [Path(arg) for arg in sys.argv[2:]]
+        ok = False
+        for article_file in article_files:
+            if not article_file.exists():
+                logger.error(f"Draft source not found: {article_file}")
+                continue
+            html = article_file.read_text(encoding="utf-8")
+            title = _extract_article_title_from_html(html, fallback=article_file.stem)
+            thumb_media_id = _extract_thumb_media_id_from_html(html)
+            media_id = publisher.create_draft(
+                title=title,
+                content=html,
+                thumb_media_id=thumb_media_id,
+            )
+            logger.info(f"Draft uploaded from {article_file} -> {media_id}")
+            ok = True
+
+        if not ok:
+            sys.exit(1)
+        return
+
     # Load config
     sources_config = load_config("sources")
     llm_config = load_config("llm")
     wechat_config = load_config("wechat")
 
     # Build components
-    crawlers = build_crawlers(sources_config)
+    if mode == "daily-live":
+        crawlers = build_live_crawlers(sources_config)
+    else:
+        crawlers = build_crawlers(sources_config)
     llm_client = LLMClient(llm_config)
 
     if mode == "test":
@@ -134,7 +305,7 @@ def main():
 
     # Run pipeline
     pipeline = Pipeline(
-        mode=mode,
+        mode="daily" if mode == "daily-live" else mode,
         crawlers=crawlers,
         llm_client=llm_client,
         publisher=publisher,
@@ -149,6 +320,17 @@ def main():
 
     if success:
         logger.info("Pipeline completed successfully")
+        # Force refresh access_token before upload to avoid expiration after long runs
+        publisher._token = None
+        publisher._token_expires = 0
+        if mode == "feature":
+            if not _upload_feature_drafts(publisher):
+                logger.error("Feature draft upload failed")
+                sys.exit(1)
+        elif mode in ("daily", "daily-live"):
+            if not _upload_daily_draft(publisher):
+                logger.error("Daily draft upload failed")
+                sys.exit(1)
     else:
         logger.error("Pipeline failed")
         sys.exit(1)

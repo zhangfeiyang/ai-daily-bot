@@ -9,13 +9,15 @@ from src.models import NewsItem
 class BaseCrawler(ABC):
     def __init__(self, config: dict):
         self.config = config
-        self._max_age_hours = config.get("max_age_hours", 24)
+        self._max_age_hours = config.get("max_age_hours")
 
     @property
     def name(self) -> str:
         return self.__class__.__name__
 
     def filter_recent(self, items: list[NewsItem]) -> list[NewsItem]:
+        if not self._max_age_hours:
+            return items
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self._max_age_hours)
         fresh = [i for i in items if i.published_at >= cutoff]
         if len(fresh) < len(items):

@@ -1,5 +1,6 @@
 # src/video/material.py
 import subprocess
+import tempfile
 from pathlib import Path
 from loguru import logger
 
@@ -16,26 +17,42 @@ class MaterialGenerator:
         self.image_gen = image_generator
 
     def generate(self, segments: list[VideoSegment], output_dir: Path) -> list[VideoMaterial]:
-        """为所有段落生成素材"""
+        """为所有段落生成素材（复用已存在的素材）"""
         output_dir.mkdir(parents=True, exist_ok=True)
         materials = []
 
         for seg in segments:
             try:
-                # 生成音频
-                audio_path = self._generate_audio(seg, output_dir)
+                # 检查是否可复用已有素材
+                audio_path = output_dir / f"segment_{seg.id}.mp3"
+                image_path = output_dir / f"segment_{seg.id}.png"
+                srt_path = output_dir / f"segment_{seg.id}.srt"
 
-                # 获取音频时长
-                duration = self._get_audio_duration(audio_path)
-                seg.duration = duration
+                # 音频：必须存在且有效
+                if audio_path.exists() and audio_path.stat().st_size > 0:
+                    logger.info(f"Reusing audio for segment {seg.id}")
+                    duration = self._get_audio_duration(audio_path)
+                    seg.duration = duration
+                else:
+                    # 生成音频
+                    audio_path = self._generate_audio(seg, output_dir)
+                    duration = self._get_audio_duration(audio_path)
+                    seg.duration = duration
 
-                # 生成图片（仅配图段落）
-                image_path = None
+                # 图片：仅配图段落需要
                 if seg.segment_type == SegmentType.WITH_IMAGE:
-                    image_path = self._generate_image(seg, output_dir)
+                    if image_path.exists() and image_path.stat().st_size > 0:
+                        logger.info(f"Reusing image for segment {seg.id}")
+                    else:
+                        image_path = self._generate_image(seg, output_dir)
+                else:
+                    image_path = None
 
-                # 生成字幕
-                srt_path = self._generate_subtitle(seg, duration, output_dir)
+                # 字幕：检查是否存在且内容匹配
+                if srt_path.exists() and srt_path.stat().st_size > 0:
+                    logger.info(f"Reusing subtitle for segment {seg.id}")
+                else:
+                    srt_path = self._generate_subtitle(seg, duration, output_dir)
 
                 materials.append(VideoMaterial(
                     segment_id=seg.id,
@@ -43,7 +60,7 @@ class MaterialGenerator:
                     image_path=image_path,
                     subtitle_srt=srt_path
                 ))
-                logger.info(f"Generated materials for segment {seg.id}")
+                logger.info(f"Materials ready for segment {seg.id}")
 
             except Exception as e:
                 logger.error(f"Failed to generate materials for segment {seg.id}: {e}")
@@ -54,8 +71,60 @@ class MaterialGenerator:
     def _generate_audio(self, segment: VideoSegment, output_dir: Path) -> Path:
         """调用TTS生成音频"""
         audio_path = output_dir / f"segment_{segment.id}.mp3"
-        self.tts.generate(segment.text, str(audio_path))
+        result = self.tts.generate(segment.text, str(audio_path))
+        if isinstance(result, list):
+            result_paths = [Path(p) for p in result]
+            if len(result_paths) == 1:
+                if result_paths[0] != audio_path:
+                    result_paths[0].replace(audio_path)
+            else:
+                self._merge_audio_parts(result_paths, audio_path)
+        elif result:
+            generated_path = Path(result)
+            if generated_path != audio_path and generated_path.exists():
+                generated_path.replace(audio_path)
+
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
+            raise RuntimeError(f"TTS did not create audio file: {audio_path}")
         return audio_path
+
+    def _merge_audio_parts(self, part_paths: list[Path], output_path: Path) -> None:
+        """Merge TTS split files into one audio file for video composition."""
+        missing = [str(p) for p in part_paths if not p.exists()]
+        if missing:
+            raise RuntimeError(f"TTS audio parts missing: {', '.join(missing)}")
+
+        with tempfile.NamedTemporaryFile(
+            "w",
+            suffix=".txt",
+            encoding="utf-8",
+            dir=output_path.parent,
+            delete=False,
+        ) as f:
+            concat_file = Path(f.name)
+            for part in part_paths:
+                escaped = part.name.replace("\\", "\\\\").replace("'", "\\'")
+                f.write(f"file '{escaped}'\n")
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", str(concat_file),
+                    "-c:a", "libmp3lame",
+                    str(output_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        finally:
+            concat_file.unlink(missing_ok=True)
+
+        for part in part_paths:
+            part.unlink(missing_ok=True)
 
     def _generate_image(self, segment: VideoSegment, output_dir: Path) -> Path | None:
         """调用Codex生成配图"""

@@ -73,3 +73,37 @@ def test_wechat_publish_article(mock_get, mock_post):
         thumb_media_id="thumb_abc",
     )
     assert result == "pub_123"
+
+
+@patch("src.publish.wechat.requests.post")
+@patch("src.publish.wechat.requests.get")
+def test_wechat_create_draft_normalizes_metadata_and_video(mock_get, mock_post):
+    config = {"app_id": "wx123", "app_secret": "secret123"}
+    publisher = WeChatPublisher(config)
+
+    mock_token_resp = MagicMock()
+    mock_token_resp.json.return_value = {"access_token": "tok123", "expires_in": 7200}
+    mock_token_resp.raise_for_status = MagicMock()
+    mock_get.return_value = mock_token_resp
+
+    mock_draft_resp = MagicMock()
+    mock_draft_resp.json.return_value = {"media_id": "draft_123"}
+    mock_draft_resp.raise_for_status = MagicMock()
+    mock_post.return_value = mock_draft_resp
+
+    content = """
+    <!-- ARTICLE_TITLE: Draft Title -->
+    <!-- THUMB_MEDIA_ID: thumb_abc -->
+    <section style="text-align:center;margin:12px 0;" data-original-url="https://video.example/demo.mp4" data-section-title="Demo 视频">
+    <video src="output/videos/demo.mp4" controls="controls" style="max-width:100%;border-radius:8px;"></video>
+    </section>
+    """
+    result = publisher.create_draft(
+        title="Draft Title",
+        content=content,
+        thumb_media_id="thumb_abc",
+    )
+
+    assert result == "draft_123"
+    assert "ARTICLE_TITLE" not in mock_post.call_args.kwargs["data"].decode("utf-8")
+    assert "video.example/demo.mp4" in mock_post.call_args.kwargs["data"].decode("utf-8")
