@@ -1535,11 +1535,19 @@ class Pipeline:
         # Track uploaded URLs to avoid duplicates
         uploaded = []
         uploaded_set = set()  # Track URLs already uploaded
+        seen_hashes = set()   # Track perceptual hashes to avoid visual duplicates
         for img_url in candidates:
             try:
                 # Skip if already uploaded (same URL)
                 if img_url in uploaded_set:
                     continue
+
+                # Check perceptual hash to avoid visual duplicates
+                phash = self._compute_image_phash(img_url)
+                if phash and phash in seen_hashes:
+                    logger.debug(f"Skipping visually duplicate image: {img_url[:50]}...")
+                    continue
+
                 img_html = self._download_and_upload_image(img_url, item.title)
                 if img_html:
                     m = re.search(r'src="([^"]+)"', img_html)
@@ -1549,6 +1557,8 @@ class Pipeline:
                         if wechat_url not in uploaded_set:
                             uploaded.append(wechat_url)
                             uploaded_set.add(wechat_url)
+                            if phash:
+                                seen_hashes.add(phash)
                         uploaded_set.add(img_url)  # Mark source URL as processed
             except Exception as e:
                 logger.debug(f"Failed to upload candidate image: {e}")
