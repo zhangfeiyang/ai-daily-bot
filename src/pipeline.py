@@ -2862,9 +2862,9 @@ class Pipeline:
                     if url2 not in removed:
                         # Remove url2's image block
                         pattern = (
-                            f'<section style="text-align:center;margin:12px 0;">'
-                            f'\s*<img src="{re.escape(url2)}" style="max-width:100%;border-radius:8px;" />'
-                            f'\s*</section>'
+                            rf'<section style="text-align:center;margin:12px 0;">'
+                            rf'\s*<img src="{re.escape(url2)}" style="max-width:100%;border-radius:8px;" />'
+                            rf'\s*</section>'
                         )
                         current_html = re.sub(pattern, '', current_html)
                         removed.add(url2)
