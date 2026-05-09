@@ -2804,6 +2804,217 @@ class Pipeline:
         # Fallback: 使用原标题转换
         return self._force_chinese_title(original_title)
 
+    def _review_and_fix_article(
+        self,
+        article_html: str,
+        title: str,
+        item: NewsItem,
+    ) -> tuple[str, str, dict]:
+        """综合审查循环：审查标题、内容、图片，最多重试3次。
+
+        Returns:
+            (fixed_html, fixed_title, review_log)
+            review_log: {"iterations": int, "title_issues": list, "content_issues": list, "image_duplicates": list}
+        """
+        review_log = {
+            "iterations": 0,
+            "title_issues": [],
+            "content_issues": [],
+            "image_duplicates": [],
+        }
+
+        current_html = article_html
+        current_title = title
+        article_text = self._strip_html(current_html)
+
+        for iteration in range(3):
+            review_log["iterations"] = iteration + 1
+            logger.info(f"Article review iteration {iteration + 1}/3")
+
+            # ── 1. 图片重复检测 ──
+            duplicates = self._find_duplicate_images_in_article(current_html)
+            if duplicates:
+                review_log["image_duplicates"].extend(duplicates)
+                # Remove duplicate images (keep first occurrence)
+                removed = set()
+                for url1, url2 in duplicates:
+                    if url2 not in removed:
+                        # Remove url2's image block
+                        pattern = (
+                            f'<section style="text-align:center;margin:12px 0;">'
+                            f'\s*<img src="{re.escape(url2)}" style="max-width:100%;border-radius:8px;" />'
+                            f'\s*</section>'
+                        )
+                        current_html = re.sub(pattern, '', current_html)
+                        removed.add(url2)
+                        logger.info(f"Removed duplicate image: {url2[:50]}...")
+
+            # ── 2. LLM 审查标题 ──
+            title_ok, title_issues = self._review_title(current_title, item.title)
+            if title_issues:
+                review_log["title_issues"].extend(title_issues)
+
+            # ── 3. LLM 审查内容 ──
+            content_ok, content_issues = self._review_content(article_text)
+            if content_issues:
+                review_log["content_issues"].extend(content_issues)
+
+            # ── 4. 判断是否需要修复 ──
+            if title_ok and content_ok and not duplicates:
+                logger.info(f"Article review passed after {iteration + 1} iteration(s)")
+                break
+
+            # ── 5. 修复 ──
+            if not title_ok or not content_ok:
+                logger.info(f"Issues found - title_ok={title_ok}, content_ok={content_ok}, fixing...")
+                current_html, current_title = self._fix_article_issues(
+                    current_html, current_title, title_issues, content_issues, item
+                )
+                article_text = self._strip_html(current_html)
+        else:
+            # 循环结束（达到最大重试次数）
+            logger.warning(f"Article review reached max iterations. title_ok={title_ok}, content_ok={content_ok}")
+
+        return current_html, current_title, review_log
+
+    @staticmethod
+    def _review_title(title: str, original_title: str) -> tuple[bool, list[str]]:
+        """审查标题：检查完整性和中英文混用（专有名词/人名除外）。
+
+        Returns:
+            (is_ok, list_of_issues)
+        """
+        issues = []
+
+        # 1. 完整性检查
+        if re.match(r'^[，、；：！？\s]|^[\d%个行颗]', title):
+            issues.append(f"标题疑似截断: '{title}'")
+        if len(title) < 5:
+            issues.append(f"标题过短 ({len(title)} 字): '{title}'")
+        if len(title) > 40:
+            issues.append(f"标题过长 ({len(title)} 字): '{title}'")
+
+        # 2. 中英文混用检查（专有名词/人名除外）
+        # 提取英文单词
+        english_words = re.findall(r'[a-zA-Z]+', title)
+        # 已知专有名词/人名白名单（不区分大小写）
+        proper_nouns = {
+            'openai', 'anthropic', 'google', 'deepmind', 'meta', 'microsoft',
+            'nvidia', 'apple', 'amazon', 'intel', 'amd', 'ibm',
+            'gpt', 'chatgpt', 'claude', 'gemini', 'llama', 'qwen', 'kimi',
+            'deepseek', 'mistral', 'grok', 'xai', 'copilot', 'cursor',
+            'sam', 'altman', 'demis', 'hassabis', 'dario', 'amodei',
+            'mark', 'zuckerberg', 'sundar', 'pichai', 'satya', 'nadella',
+            'elon', 'musk', 'tim', 'cook', 'jensen', 'huang',
+            'ai', 'llm', 'ml', 'api', 'gpu', 'cpu', 'ram', 'url',
+            'ceo', 'cto', 'cfo', 'coo', 'cso',
+            'python', 'javascript', 'java', 'rust', 'go', 'cpp', 'c++',
+            'github', 'huggingface', 'hf', 'arxiv', 'reddit', 'twitter',
+            'ios', 'android', 'macos', 'windows', 'linux',
+            'usd', 'rmb', 'cn', 'us', 'uk', 'eu',
+            'pdf', 'html', 'css', 'json', 'xml', 'sql', 'nosql',
+            'saas', 'paas', 'iaas', 'docker', 'kubernetes', 'k8s',
+            'wifi', 'bluetooth', 'nfc', 'qr', 'vpn',
+        }
+        for word in english_words:
+            word_lower = word.lower()
+            if len(word) >= 2 and word_lower not in proper_nouns:
+                issues.append(f"标题包含非专有名词英文: '{word}'")
+
+        return len(issues) == 0, issues
+
+    def _review_content(self, article_text: str) -> tuple[bool, list[str]]:
+        """使用 LLM 审查内容缺陷。
+
+        Returns:
+            (is_ok, list_of_issues)
+        """
+        review_prompt = """你是一位资深中文科技编辑，负责审查以下文章的质量。
+
+请检查以下问题，只列出发现的问题（每行一条），如果没有问题只回复"PASS"。
+
+检查项：
+1. AI 味：是否存在"值得注意的是""总的来说""可以说""未来可期""让我们拭目以待""毋庸置疑""随着...的发展""在...的背景下"等 AI 常用套话
+2. 事实错误：版本号、人名、职位、公司名称、数据是否明显错误或与常识不符
+3. 逻辑问题：论证是否跳跃、因果是否成立、是否存在自相矛盾
+4. 空洞评价：是否存在"意义重大""影响深远""值得关注""具有里程碑意义"等无具体说明的评价
+5. 段落过长：是否存在超过100字的段落未拆分
+
+只输出问题列表，每条一行。没有则只回复 PASS。"""
+
+        try:
+            result = self.llm.generate(review_prompt, article_text[:3000], temperature=0.2)
+            result = result.strip()
+            if result.upper() == "PASS" or not result:
+                return True, []
+
+            issues = [line.strip() for line in result.split("\n") if line.strip() and line.strip().upper() != "PASS"]
+            return len(issues) == 0, issues
+        except Exception as e:
+            logger.warning(f"Content review LLM call failed: {e}")
+            # LLM 调用失败时，退回到规则检查
+            return self._review_content_fallback(article_text)
+
+    @staticmethod
+    def _review_content_fallback(article_text: str) -> tuple[bool, list[str]]:
+        """LLM 审查失败时的规则回退检查。"""
+        issues = []
+        ai_phrases = [
+            "值得注意的是", "总的来说", "可以说", "未来可期", "让我们拭目以待",
+            "毋庸置疑", "时间会给出答案", "这背后的逻辑是",
+            "随着...的发展", "在...的背景下", "从...的角度来看",
+            "意义重大", "影响深远", "值得关注", "具有里程碑意义",
+        ]
+        for phrase in ai_phrases:
+            if phrase in article_text:
+                issues.append(f"存在AI套话: '{phrase}'")
+        return len(issues) == 0, issues
+
+    def _fix_article_issues(
+        self,
+        article_html: str,
+        title: str,
+        title_issues: list[str],
+        content_issues: list[str],
+        item: NewsItem,
+    ) -> tuple[str, str]:
+        """让 LLM 修复文章中的问题。"""
+        article_text = self._strip_html(article_html)
+
+        # 构建修复提示
+        fix_prompt = "你是一位资深中文科技编辑，请修复以下文章中的问题。\n\n"
+        if title_issues:
+            fix_prompt += "【标题问题】\n" + "\n".join(f"- {i}" for i in title_issues) + "\n\n"
+        if content_issues:
+            fix_prompt += "【内容问题】\n" + "\n".join(f"- {i}" for i in content_issues) + "\n\n"
+
+        fix_prompt += """修复要求：
+1. 保持文章核心事实不变
+2. 保持 Markdown 格式（## 标题、**加粗**等）
+3. 保留所有参考链接
+4. 只输出修复后的文章全文，不要解释修改了什么
+5. 不要添加元评论如"以下是修订版"
+
+---文章开始---
+"""
+
+        try:
+            fixed_text = self.llm.generate(fix_prompt, article_text, temperature=0.3)
+            fixed_text = self._clean_llm_output(fixed_text)
+
+            # 如果标题有问题，重新生成标题
+            fixed_title = title
+            if title_issues:
+                fixed_title = self._generate_chinese_title_from_article(
+                    self._markdown_to_html(fixed_text), item.title
+                )
+
+            fixed_html = self._markdown_to_html(fixed_text)
+            return fixed_html, fixed_title
+        except Exception as e:
+            logger.warning(f"Article fix failed: {e}, returning original")
+            return article_html, title
+
     @staticmethod
     def _force_chinese_title(title: str) -> str:
         """规则生成中文标题（LLM 翻译失败时的 fallback）。"""
