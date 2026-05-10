@@ -1,94 +1,63 @@
 # src/image/generator.py
-"""Image generator using Codex gpt-5.5 built-in image_gen tool."""
+"""Image generator using MiniMax API."""
 
 import os
 import re
-import shutil
-import subprocess
 import time
 from pathlib import Path
 
+import requests
 from loguru import logger
 
 
 class ImageGenerator:
-    """Generate images via Codex gpt-5.5 with built-in image_gen skill."""
+    """Generate images via MiniMax image-01 API."""
+
+    API_URL = "https://api.minimax.chat/v1/image_generation"
+    DEFAULT_MODEL = "image-01"
 
     def __init__(self):
         self.enabled = True
-        self.model = "gpt-5.5"
-        self._codex_home = os.path.expanduser("~/.codex")
+        self.api_key = os.environ.get("MINIMAX_API_KEY") or os.environ.get("IMAGE_API_KEY")
+        self.model = self.DEFAULT_MODEL
 
-    def _find_latest_generated_image(self, session_id: str = None) -> Path | None:
-        """Find the most recently generated image in codex output directory."""
-        gen_dir = Path(self._codex_home) / "generated_images"
-        if not gen_dir.exists():
-            return None
+    def _call_api(self, prompt: str, aspect_ratio: str = "16:9", n: int = 1) -> dict:
+        """Call MiniMax image generation API."""
+        if not self.api_key:
+            raise RuntimeError("MiniMax API key not configured. Set MINIMAX_API_KEY or IMAGE_API_KEY env var.")
 
-        candidates = []
-        for subdir in gen_dir.iterdir():
-            if not subdir.is_dir():
-                continue
-            if session_id and subdir.name != session_id:
-                continue
-            for f in subdir.glob("*.png"):
-                candidates.append((f.stat().st_mtime, f))
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
 
-        if not candidates:
-            return None
-        candidates.sort(reverse=True)
-        return candidates[0][1]
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "n": n,
+        }
 
-    def _run_codex_image_gen(
-        self,
-        prompt: str,
-        output_path: str,
-        size: str = "1024x576",
-    ) -> Path:
-        """Call codex exec to generate image via gpt-5.5."""
-        logger.info(f"Generating image via Codex {self.model}: {prompt[:60]}...")
+        logger.info(f"Calling MiniMax image API: prompt={prompt[:60]}...")
         t0 = time.time()
 
-        # Build codex exec command
-        cmd = [
-            "codex", "exec",
-            "-m", self.model,
-            "-s", "danger-full-access",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--ephemeral",
-            prompt,
-        ]
+        resp = requests.post(self.API_URL, headers=headers, json=payload, timeout=120)
+        resp.raise_for_status()
 
-        # Run codex
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        data = resp.json()
+        logger.info(f"MiniMax API responded in {time.time() - t0:.1f}s")
+        return data
 
-        # Extract session id from output to find the generated image
-        session_id = None
-        for line in result.stderr.split("\n"):
-            if "session id:" in line:
-                session_id = line.split("session id:")[1].strip()
-                break
+    def _download_image(self, image_url: str, output_path: str) -> Path:
+        """Download image from URL to local path."""
+        resp = requests.get(image_url, timeout=60)
+        resp.raise_for_status()
 
-        # Find generated image
-        generated = self._find_latest_generated_image(session_id)
-        if not generated:
-            # Fallback: search all recent images
-            generated = self._find_latest_generated_image()
-
-        if not generated:
-            raise RuntimeError("Codex did not generate any image")
-
-        # Copy to desired output path
         out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(generated, out_file)
+        out_file.write_bytes(resp.content)
 
-        logger.info(f"Image generated in {time.time() - t0:.1f}s, saved to {out_file}")
+        logger.info(f"Image downloaded to {out_file} ({len(resp.content)} bytes)")
         return out_file
 
     def generate(
@@ -98,12 +67,12 @@ class ImageGenerator:
         quality: str = "medium",
         output_path: str = None,
     ) -> Path:
-        """Generate an image from text prompt via Codex.
+        """Generate an image from text prompt via MiniMax.
 
         Args:
             prompt: Text description for image generation
-            size: Image size, e.g. "1024x576", "1024x1024"
-            quality: Image quality - "low", "medium", "high" (used in prompt)
+            size: Image size, e.g. "1024x576", "1024x1024". Maps to aspect_ratio.
+            quality: Image quality - "low", "medium", "high" (unused, MiniMax has fixed quality)
             output_path: Where to save the image
 
         Returns:
@@ -112,20 +81,31 @@ class ImageGenerator:
         if not self.enabled:
             raise RuntimeError("Image generation is disabled by configuration")
 
-        # Augment prompt with quality and size hints
-        full_prompt = (
-            f"生成一张图片并保存到指定路径。"
-            f"图片内容：{prompt}"
-            f"质量要求：{quality}。"
-            f"尺寸参考：{size}。"
-            f"请使用 image_gen 工具生成真实的 AI 图像，"
-            f"不要编写代码绘制。生成后保存到：{output_path or 'output/generated.png'}"
-        )
+        # Map size to aspect_ratio
+        aspect_ratio_map = {
+            "1024x1024": "1:1",
+            "1024x576": "16:9",
+            "576x1024": "9:16",
+            "800x448": "16:9",
+            "448x800": "9:16",
+        }
+        aspect_ratio = aspect_ratio_map.get(size, "16:9")
+
+        # Call API
+        data = self._call_api(prompt, aspect_ratio=aspect_ratio, n=1)
+
+        # Extract image URL from response
+        # Response format: {"data": {"image_urls": ["url1", ...]}, "base_resp": {...}}
+        image_urls = data.get("data", {}).get("image_urls", [])
+        if not image_urls:
+            raise RuntimeError(f"MiniMax returned no image URLs. Response: {data}")
+
+        image_url = image_urls[0]
 
         if output_path is None:
             output_path = "output/cover/generated.png"
 
-        return self._run_codex_image_gen(full_prompt, output_path, size)
+        return self._download_image(image_url, output_path)
 
     def generate_cover(self, article_title: str, article_summary: str = "") -> Path:
         """Generate a cover image for an AI news article."""
