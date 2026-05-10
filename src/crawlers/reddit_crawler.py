@@ -1,6 +1,7 @@
 # src/crawlers/reddit_crawler.py
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import re
 
 import feedparser
 import requests
@@ -11,10 +12,28 @@ from src.models import NewsItem
 
 
 class RedditCrawler(BaseCrawler):
+    # Low-quality keywords that indicate low-engagement / meta posts
+    LOW_QUALITY_KEYWORDS = [
+        "hiring", "self-promotion", "weekly thread", "rules", "megathread",
+        "career", "interview", "resume", "salary", "negotiation",
+        "desk-rejected", "reviewers", "proceedings missing",
+        "how do i", "what is", "help with", "question about",
+        "looking for", "anyone know", "is it worth", "should i",
+        "advice needed", "need help", "newbie", "beginner",
+    ]
+
+    # High-quality indicators (research/code releases get these flairs/tags)
+    HIGH_QUALITY_INDICATORS = [
+        "[r]", "[research]", "[p]", "[project]",
+        "paper", "github", "release", "open source",
+    ]
+
     def fetch(self) -> list[NewsItem]:
         subreddits = self.config.get("subreddits", ["MachineLearning"])
         sort = self.config.get("sort", "hot")
         limit = self.config.get("limit", 15)
+        # Minimum score threshold (upvotes) for a post to be included
+        min_score = self.config.get("min_score", 20)
 
         items = []
         for sub_name in subreddits:
@@ -34,9 +53,22 @@ class RedditCrawler(BaseCrawler):
                     continue
 
                 link = entry.get("link", "")
+
+                # Fetch post score via Reddit JSON API
+                score = self._fetch_post_score(link)
+                if score is not None and score < min_score:
+                    logger.debug(f"Reddit: skipping low-score post ({score} < {min_score}): {title[:50]}...")
+                    continue
+
+                # Fallback: heuristic filtering when score is unavailable
+                if score is None:
+                    quality = self._assess_post_quality(title, entry)
+                    if quality == "low":
+                        logger.debug(f"Reddit: skipping low-quality post: {title[:50]}...")
+                        continue
+
                 content = entry.get("summary", title)
                 # Strip HTML from summary
-                import re
                 content = re.sub(r"<[^>]+>", "", content)[:2000]
 
                 author = entry.get("author", "")
@@ -98,7 +130,71 @@ class RedditCrawler(BaseCrawler):
                     author=author,
                     published_at=pub_date,
                     tags=tags,
-                    raw_data={"subreddit": sub_name, "image_url": image_url, "video_url": video_url, "links": links[:5]},
+                    raw_data={
+                        "subreddit": sub_name,
+                        "image_url": image_url,
+                        "video_url": video_url,
+                        "links": links[:5],
+                        "reddit_score": score,
+                    },
                 ))
 
         return self.filter_recent(items)
+
+    def _assess_post_quality(self, title: str, entry) -> str:
+        """Heuristic quality assessment when Reddit API score is unavailable.
+
+        Returns: 'high', 'medium', or 'low'
+        """
+        title_lower = title.lower()
+        content = entry.get("summary", "").lower()
+
+        # Check low-quality keywords
+        for kw in self.LOW_QUALITY_KEYWORDS:
+            if kw in title_lower:
+                return "low"
+
+        # Check high-quality indicators
+        for indicator in self.HIGH_QUALITY_INDICATORS:
+            if indicator in title_lower:
+                return "high"
+
+        # Posts with external links are more likely to be news
+        external_links = re.findall(r'href="(https?://[^"]+)"', entry.get("summary", ""))
+        external_links = [l for l in external_links if not l.startswith("https://www.reddit.com")]
+        if external_links:
+            return "high"
+
+        # Default: medium (let downstream pipeline decide)
+        return "medium"
+
+    def _fetch_post_score(self, post_url: str) -> int | None:
+        """Fetch post score (upvotes) via Reddit JSON API.
+
+        Reddit provides JSON data for any page by appending .json to the URL.
+        Returns None if the request fails.
+        """
+        if not post_url:
+            return None
+
+        # Ensure URL ends without trailing slash before adding .json
+        json_url = post_url.rstrip("/") + ".json"
+        try:
+            resp = requests.get(
+                json_url,
+                headers={"User-Agent": "ai-news-bot/1.0"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Reddit JSON structure: [post_data, comments_data]
+            # post_data[0]["data"]["children"][0]["data"]["score"]
+            if isinstance(data, list) and len(data) > 0:
+                post_list = data[0].get("data", {}).get("children", [])
+                if post_list:
+                    return post_list[0].get("data", {}).get("score")
+            return None
+        except Exception as e:
+            logger.debug(f"Reddit: failed to fetch score for {post_url[:50]}...: {e}")
+            return None

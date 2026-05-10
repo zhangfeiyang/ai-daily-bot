@@ -20,6 +20,9 @@ reddit:
   limit: 25
   time_filter: day
   max_age_hours: 24
+  # Minimum upvotes for a post to be included
+  # Posts below this threshold are filtered out
+  min_score: 20
 
 twitter:
   enabled: true
