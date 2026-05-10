@@ -2826,6 +2826,14 @@ class Pipeline:
                 if title_answer.startswith('人') and len(title_answer) > 1 and title_answer[1] in '公司民':
                     logger.warning(f"Title attempt {attempt+1} appears truncated: {title_answer}")
                     continue
+                # "GB"开头可能是"XGB"（如12GB）的截断
+                if title_answer.startswith('GB') and len(title_answer) > 2:
+                    logger.warning(f"Title attempt {attempt+1} appears truncated: {title_answer}")
+                    continue
+                # 逗号开头可能是数字截断（如"2,230"变成",230"）
+                if title_answer.startswith(','):
+                    logger.warning(f"Title attempt {attempt+1} appears truncated: {title_answer}")
+                    continue
                 # 确保包含中文且长度合理
                 if title_answer and re.search(r'[一-鿿]', title_answer) and 5 <= len(title_answer) <= 40:
                     return title_answer
