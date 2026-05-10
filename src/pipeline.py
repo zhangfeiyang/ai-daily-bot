@@ -171,6 +171,9 @@ class Pipeline:
                 article_title=f"AI 科技前沿 | {today}",
             )
 
+            # Append reference links to each news section
+            article_html = self._append_daily_reference_links(article_html, all_items)
+
             title = f"AI 科技前沿 | {today}"
             article_html = self._prepend_article_metadata(article_html, title, thumb_media_id)
 
@@ -331,7 +334,20 @@ class Pipeline:
             except Exception as e:
                 logger.warning(f"Failed to download selected cover image: {e}")
 
-        # Fallback: use default thumb (skip AI generation in debug mode)
+        # Fallback: use AI-generated cover image
+        try:
+            from src.image.generator import ImageGenerator
+            gen = ImageGenerator()
+            cover_file = gen.generate_cover(
+                article_title="AI 科技前沿",
+                article_summary=article_text[:200],
+            )
+            media_id = self.publisher.upload_thumb(str(cover_file))
+            logger.info(f"AI cover generated for daily, media_id={media_id}")
+            return media_id
+        except Exception as e:
+            logger.warning(f"AI cover generation failed: {e}")
+
         logger.info("No suitable news image found, using default cover")
         return ""
 
@@ -3509,7 +3525,7 @@ class Pipeline:
             # 行内 Markdown → HTML（只对非标题行处理）
             if stripped.startswith("## "):
                 content = Pipeline._inline_md_to_html(stripped[3:])
-                html_parts.append(f'<section style="margin:20px 0 8px 0;"><h2 style="color:#1a1a2e;font-size:18px;border-left:4px solid #e94560;padding-left:10px;margin:0;">{content}</h2></section>')
+                html_parts.append(f'<section style="margin:28px 0 12px 0;padding-top:12px;border-top:1px solid #e94560;"><h2 style="color:#1a1a2e;font-size:18px;text-align:center;margin:0;">{content}</h2></section>')
             elif stripped.startswith("# "):
                 content = Pipeline._inline_md_to_html(stripped[2:])
                 html_parts.append(f'<h1 style="color:#1a1a2e;font-size:22px;text-align:center;"><strong>{content}</strong></h1>')
