@@ -359,7 +359,7 @@ class Pipeline:
         Skips sections that reference social media sources (Reddit/Twitter), since
         those will have screenshots inserted separately by _insert_social_screenshots.
         """
-        h2_pattern = r'<section style="margin:20px 0 8px 0;"><h2 style="color:#1a1a2e[^"]*">([^<]+)</h2></section>'
+        h2_pattern = r'<section style="margin:2[08]px[^"]*"><h2 style="color:#1a1a2e[^"]*">([^<]+)</h2></section>'
         h2_matches = list(re.finditer(h2_pattern, article_html))
 
         if not h2_matches:
@@ -488,7 +488,11 @@ class Pipeline:
 
     @staticmethod
     def _section_plain_text(article_html: str, section_start: int, limit: int = 700) -> str:
-        next_h2 = article_html.find('<section style="margin:20px 0 8px 0;"><h2', section_start)
+        next_h2 = article_html.find('<section style="margin:2', section_start)
+        if next_h2 != -1:
+            # verify it's actually an h2 section start, not just the margin prefix
+            if '<h2' not in article_html[next_h2:next_h2+80]:
+                next_h2 = -1
         section_html = article_html[section_start: next_h2 if next_h2 != -1 else section_start + limit * 4]
         text = re.sub(r"<[^>]+>", "", section_html)
         text = re.sub(r"\s+", " ", text).strip()
@@ -1602,7 +1606,7 @@ class Pipeline:
                 logger.debug(f"Failed to upload candidate image: {e}")
 
         # Find h2 sections first
-        h2_pattern = r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>'
+        h2_pattern = r'<section style="margin:2[08]px[^"]*"><h2[^>]*>[^<]+</h2></section>'
         h2_matches = list(re.finditer(h2_pattern, article_html))
 
         # If no candidate images, skip generation — use news source images only
@@ -1741,7 +1745,7 @@ class Pipeline:
                     return url
 
                 normalized_target = normalize_url(item_url)
-                h2_pattern = re.compile(r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>')
+                h2_pattern = re.compile(r'<section style="margin:2[08]px[^"]*"><h2[^>]*>[^<]+</h2></section>')
                 sections = list(h2_pattern.finditer(html))
                 for i, match in enumerate(sections):
                     section_start = match.start()
@@ -1762,7 +1766,9 @@ class Pipeline:
                                 logger.debug(f"Section already has image, skipping Twitter screenshot for {item_url[:50]}...")
                                 return None
                             return (next_start, section_start)
-                first_h2 = html.find('<section style="margin:20px')
+                first_h2 = html.find('<section style="margin:28px')
+                if first_h2 == -1:
+                    first_h2 = html.find('<section style="margin:20px')
                 if first_h2 > 0:
                     # Check if pre-h2 area already has images
                     if Pipeline._section_has_image(html, 0, first_h2):
@@ -1883,7 +1889,7 @@ class Pipeline:
                 normalized_target = normalize_url(item_url)
 
                 # Find all h2 sections
-                h2_pattern = re.compile(r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>')
+                h2_pattern = re.compile(r'<section style="margin:2[08]px[^"]*"><h2[^>]*>[^<]+</h2></section>')
                 sections = list(h2_pattern.finditer(html))
 
                 # Look for item_url in each section (try both exact and normalized match)
@@ -1916,7 +1922,9 @@ class Pipeline:
                             return (next_start, section_start)
 
                 # Fallback: insert before first h2 if no match found
-                first_h2 = html.find('<section style="margin:20px')
+                first_h2 = html.find('<section style="margin:28px')
+                if first_h2 == -1:
+                    first_h2 = html.find('<section style="margin:20px')
                 if first_h2 > 0:
                     # Check if area before first h2 already has images
                     if Pipeline._section_has_image(html, 0, first_h2):
@@ -2143,7 +2151,7 @@ class Pipeline:
 
     @staticmethod
     def _find_last_section_heading(article_html: str, upto: int):
-        h2_pattern = r'<section style="margin:20px[^"]*"><h2[^>]*>([^<]+)</h2></section>'
+        h2_pattern = r'<section style="margin:2[08]px[^"]*"><h2[^>]*>([^<]+)</h2></section>'
         last_match = None
         for match in re.finditer(h2_pattern, article_html[:upto]):
             last_match = match
@@ -3304,7 +3312,7 @@ class Pipeline:
         # Find each h2 section and append reference links after it
         # We match h2 sections and try to find the corresponding item by URL presence
         h2_pattern = re.compile(
-            r'(<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>)'
+            r'(<section style="margin:2[08]px[^"]*"><h2[^>]*>[^<]+</h2></section>)'
         )
 
         # Build a section-to-links mapping by scanning for URLs near each section
@@ -3513,19 +3521,20 @@ class Pipeline:
                     rest = stripped[3:].lstrip('：: ')
                 urls = re.findall(r'https?://\S+', rest)
                 if urls:
-                    url_links = " ".join(
+                    # Each URL on its own line for readability
+                    url_links = "\n".join(
                         f'<a href="{u}" style="color:#bbb;text-decoration:none;word-break:break-all;">{u}</a>'
                         for u in urls
                     )
                     html_parts.append(
-                        f'<p style="color:#888;font-size:13px;margin:6px 0;line-height:1.6;">参考：{url_links}</p>'
+                        f'<p style="color:#888;font-size:13px;margin:6px 0;line-height:1.6;">参考：<br/>{url_links}</p>'
                     )
                 continue
 
             # 行内 Markdown → HTML（只对非标题行处理）
             if stripped.startswith("## "):
                 content = Pipeline._inline_md_to_html(stripped[3:])
-                html_parts.append(f'<section style="margin:28px 0 12px 0;padding-top:12px;border-top:1px solid #e94560;"><h2 style="color:#1a1a2e;font-size:18px;text-align:center;margin:0;">{content}</h2></section>')
+                html_parts.append(f'<section style="margin:36px 0 12px 0;padding:16px 0 8px 0;border-top:1px solid #e94560;border-bottom:1px solid #eee;"><h2 style="color:#1a1a2e;font-size:18px;text-align:center;margin:0;">{content}</h2></section>')
             elif stripped.startswith("# "):
                 content = Pipeline._inline_md_to_html(stripped[2:])
                 html_parts.append(f'<h1 style="color:#1a1a2e;font-size:22px;text-align:center;"><strong>{content}</strong></h1>')
