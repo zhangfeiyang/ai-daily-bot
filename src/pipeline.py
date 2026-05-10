@@ -139,10 +139,6 @@ class Pipeline:
             # Convert markdown-style text to HTML for WeChat
             article_html = self._markdown_to_html(article_text)
 
-            # Append reference links for daily/weekly articles
-            if self.mode in ("daily", "weekly"):
-                article_html = self._append_daily_reference_links(article_html, all_items)
-
             # Truncate if too long for WeChat (limit ~60000 chars)
             if len(article_html) > 60000:
                 article_html = article_html[:60000]
@@ -165,8 +161,8 @@ class Pipeline:
             # 4.6 Insert screenshots from social media sources (Reddit, Twitter, HuggingFace)
             # Only for items that are actually used in the article
             used_items = self._extract_items_from_article(article_html, all_items)
-            for item in used_items:
-                article_html = self._insert_social_screenshots(article_html, item)
+            for item, matched_url in used_items:
+                article_html = self._insert_social_screenshots(article_html, item, matched_url)
 
             article_html = self._review_and_repair_article_images(
                 article_html,
@@ -218,20 +214,24 @@ class Pipeline:
         return result
 
     @staticmethod
-    def _extract_items_from_article(article_html: str, items: list[NewsItem]) -> list[NewsItem]:
-        """Extract items that are referenced in the article based on URL matching."""
-        used_items = []
+    def _extract_items_from_article(article_html: str, items: list[NewsItem]) -> list[tuple[NewsItem, str]]:
+        """Extract items that are referenced in the article based on URL matching.
+
+        Returns list of (item, matched_url) tuples where matched_url is the URL
+        that was actually found in the article (either item.url or a reference link).
+        """
+        used_items: list[tuple[NewsItem, str]] = []
         for item in items:
             # Check if item URL appears in article
             if item.url and item.url in article_html:
-                used_items.append(item)
+                used_items.append((item, item.url))
                 continue
             # Check if any reference links appear in article
             raw = item.raw_data or {}
             links = raw.get("links", []) or []
             for link in links:
                 if link in article_html:
-                    used_items.append(item)
+                    used_items.append((item, link))
                     break
         return used_items
 
@@ -338,13 +338,29 @@ class Pipeline:
     def _insert_section_images(
         self, article_html: str, items: list[NewsItem], article_text: str, article_title: str = ""
     ) -> str:
-        """Insert media after each section, using title similarity, source media, and generation fallback."""
+        """Insert media after each section, using title similarity, source media, and generation fallback.
+
+        Skips sections that reference social media sources (Reddit/Twitter), since
+        those will have screenshots inserted separately by _insert_social_screenshots.
+        """
         h2_pattern = r'<section style="margin:20px 0 8px 0;"><h2 style="color:#1a1a2e[^"]*">([^<]+)</h2></section>'
         h2_matches = list(re.finditer(h2_pattern, article_html))
 
         if not h2_matches:
             logger.info("No h2 sections found for image insertion")
             return article_html
+
+        # Build a set of URLs from social media items that will have screenshots inserted
+        social_urls = set()
+        for item in items:
+            if not item.url:
+                continue
+            url_lower = item.url.lower()
+            if any(domain in url_lower for domain in ["reddit.com", "twitter.com", "x.com", "huggingface.co"]):
+                social_urls.add(item.url)
+                # Also add reference links
+                for link in (item.raw_data or {}).get("links", []) or []:
+                    social_urls.add(link)
 
         insertions = []
         api_gen_count = 0
@@ -354,6 +370,12 @@ class Pipeline:
         for section_index, match in reversed(list(enumerate(h2_matches))):
             section_title = match.group(1).strip()
             section_context = self._section_plain_text(article_html, match.end())
+
+            # Skip sections that reference social media URLs - they get screenshots instead
+            section_has_social = any(url in section_context for url in social_urls)
+            if section_has_social:
+                logger.debug(f"Skipping section image for social media section: {section_title[:40]}")
+                continue
 
             cached_url = get_cached_image(section_title, self._img_cache, namespace=article_title)
             if cached_url:
@@ -1669,11 +1691,8 @@ class Pipeline:
         )
         return article_html
 
-    def _insert_twitter_screenshots(self, article_html: str, item: NewsItem) -> str:
-        """Capture Twitter screenshots and insert them into article HTML.
-
-        Inserts screenshots after relevant sections or at the beginning of the article.
-        """
+    def _insert_twitter_screenshots(self, article_html: str, item: NewsItem, matched_url: str = "") -> str:
+        """Capture Twitter screenshots and insert them near the relevant section."""
         try:
             from src.utils.twitter_screenshot import TwitterScreenshot
 
@@ -1688,26 +1707,68 @@ class Pipeline:
             if not screenshot_path:
                 return article_html
 
+            # Use matched_url for positioning if it's a Twitter URL
+            position_url = matched_url if matched_url and ("twitter.com" in matched_url or "x.com" in matched_url) else tweet_url
+
+            def _find_insertion_pos(html: str, item_url: str) -> tuple[int, int] | None:
+                """Find position after the section that references item_url.
+
+                Returns (insert_pos, section_start) or None if not found.
+                """
+                if not item_url:
+                    return None
+
+                def normalize_url(url: str) -> str:
+                    url = url.rstrip('/')
+                    if '#' in url:
+                        url = url.split('#')[0]
+                    return url
+
+                normalized_target = normalize_url(item_url)
+                h2_pattern = re.compile(r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>')
+                sections = list(h2_pattern.finditer(html))
+                for i, match in enumerate(sections):
+                    section_start = match.start()
+                    section_end = match.end()
+                    next_start = sections[i + 1].start() if i + 1 < len(sections) else len(html)
+                    section_html = html[section_end:next_start]
+                    if item_url in section_html:
+                        # Check if this section already has an image
+                        if Pipeline._section_has_image(html, section_end, next_start):
+                            logger.debug(f"Section already has image, skipping Twitter screenshot for {item_url[:50]}...")
+                            return None
+                        return (next_start, section_start)
+                    # Try normalized match
+                    url_pattern = re.compile(r'https?://[^\s"<>]+')
+                    for found_url in url_pattern.findall(section_html):
+                        if normalize_url(found_url) == normalized_target:
+                            if Pipeline._section_has_image(html, section_end, next_start):
+                                logger.debug(f"Section already has image, skipping Twitter screenshot for {item_url[:50]}...")
+                                return None
+                            return (next_start, section_start)
+                first_h2 = html.find('<section style="margin:20px')
+                if first_h2 > 0:
+                    # Check if pre-h2 area already has images
+                    if Pipeline._section_has_image(html, 0, first_h2):
+                        logger.debug(f"Pre-h2 area already has images, skipping Twitter screenshot fallback")
+                        return None
+                    return (first_h2, 0)
+                return None
+
             # Upload to WeChat
             upload_image = getattr(self.publisher, "upload_image", None)
             if not callable(upload_image):
-                # In debug mode or no publisher, use local path
                 img_html = (
                     f'<section style="text-align:center;margin:12px 0;">'
                     f'<img src="{screenshot_path.as_posix()}" style="max-width:100%;border-radius:8px;" />'
                     f'</section>'
                 )
-                # Insert before first h2 section (after intro)
-                first_h2 = article_html.find('<section style="margin:20px')
-                if first_h2 > 0:
-                    article_html = article_html[:first_h2] + img_html + "\n\n" + article_html[first_h2:]
+                result = _find_insertion_pos(article_html, position_url)
+                if result:
+                    pos, _ = result
+                    article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
                 else:
-                    first_p_end = article_html.find("</p>")
-                    if first_p_end > 0:
-                        insert_pos = first_p_end + 4
-                        article_html = article_html[:insert_pos] + "\n\n" + img_html + article_html[insert_pos:]
-                    else:
-                        article_html = img_html + "\n\n" + article_html
+                    article_html += "\n" + img_html
                 return article_html
 
             wechat_url = upload_image(str(screenshot_path))
@@ -1717,21 +1778,13 @@ class Pipeline:
                     f'<img src="{wechat_url}" style="max-width:100%;border-radius:8px;" />'
                     f'</section>'
                 )
-                # Insert after the first "intro" paragraph (before first h2 section)
-                # Find first h2 section and insert before it
-                first_h2 = article_html.find('<section style="margin:20px')
-                if first_h2 > 0:
-                    # Insert before first h2
-                    article_html = article_html[:first_h2] + img_html + "\n\n" + article_html[first_h2:]
+                result = _find_insertion_pos(article_html, position_url)
+                if result:
+                    pos, _ = result
+                    article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
                 else:
-                    # Fallback: insert after first paragraph
-                    first_p_end = article_html.find("</p>")
-                    if first_p_end > 0:
-                        insert_pos = first_p_end + 4
-                        article_html = article_html[:insert_pos] + "\n\n" + img_html + article_html[insert_pos:]
-                    else:
-                        article_html = img_html + "\n\n" + article_html
-                logger.info(f"Inserted Twitter screenshot: {wechat_url}")
+                    article_html += "\n" + img_html
+                logger.info(f"Inserted Twitter screenshot near relevant section: {wechat_url[:50]}...")
 
             # Also capture screenshots from referenced tweet links in raw_data
             raw = item.raw_data or {}
@@ -1741,7 +1794,7 @@ class Pipeline:
                 if "twitter.com" in url or "x.com" in url
             ]
 
-            for ref_url in tweet_urls[:2]:  # Max 2 additional screenshots
+            for ref_url in tweet_urls[:1]:  # Max 1 additional screenshot
                 ref_path = screenshot.capture(ref_url)
                 if ref_path:
                     ref_wechat_url = upload_image(str(ref_path))
@@ -1751,23 +1804,35 @@ class Pipeline:
                             f'<img src="{ref_wechat_url}" style="max-width:100%;border-radius:8px;" />'
                             f'</section>'
                         )
-                        # Insert before reference links section
-                        ref_section = article_html.find('<section style="margin:24px')
-                        if ref_section > 0:
-                            article_html = article_html[:ref_section] + ref_img_html + "\n\n" + article_html[ref_section:]
+                        result = _find_insertion_pos(article_html, ref_url)
+                        if result:
+                            pos, _ = result
+                            article_html = article_html[:pos] + "\n" + ref_img_html + "\n" + article_html[pos:]
                         else:
-                            article_html += "\n\n" + ref_img_html
+                            article_html += "\n" + ref_img_html
 
         except Exception as e:
             logger.warning(f"Failed to insert Twitter screenshots: {e}")
 
         return article_html
 
-    def _insert_social_screenshots(self, article_html: str, item: NewsItem) -> str:
-        """Capture and insert screenshots from social media sources (Reddit, Twitter, HuggingFace).
+    @staticmethod
+    def _section_has_image(html: str, section_start: int, section_end: int) -> bool:
+        """Check if a section already contains an image."""
+        section_html = html[section_start:section_end]
+        return '<img ' in section_html
 
-        Screenshots are MANDATORY for credibility. This method ensures every article
-        from Reddit, Twitter, or HuggingFace has at least one screenshot.
+    def _insert_social_screenshots(self, article_html: str, item: NewsItem, matched_url: str = "") -> str:
+        """Capture and insert screenshots from social media sources near relevant sections.
+
+        Screenshots are inserted next to the section that references the item's URL,
+        rather than all piled at the beginning of the article.
+        Skips sections that already have images to avoid piling.
+
+        Args:
+            article_html: The article HTML.
+            item: The news item.
+            matched_url: The URL that was actually found in the article (may differ from item.url).
         """
         try:
             upload_image = getattr(self.publisher, "upload_image", None)
@@ -1777,9 +1842,74 @@ class Pipeline:
             raw = item.raw_data or {}
             links = raw.get("links", []) or []
             url_lower = item.url.lower() if item.url else ""
-            screenshot_inserted = False  # Track if we've inserted a screenshot
+            screenshot_inserted = False
 
-            # ========== Reddit Screenshots (MANDATORY) ==========
+            # Use matched_url for positioning if available, otherwise fall back to item.url
+            position_url = matched_url or item.url or ""
+
+            # Find the best insertion position: near the section that references this item
+            def _find_insertion_pos(html: str, item_url: str) -> tuple[int, int] | None:
+                """Find position after the section that references item_url.
+
+                Returns (insert_pos, section_start) or None if not found.
+                """
+                if not item_url:
+                    return None
+
+                # Normalize URL for matching (remove trailing slash, fragment)
+                def normalize_url(url: str) -> str:
+                    url = url.rstrip('/')
+                    # Remove fragment
+                    if '#' in url:
+                        url = url.split('#')[0]
+                    return url
+
+                normalized_target = normalize_url(item_url)
+
+                # Find all h2 sections
+                h2_pattern = re.compile(r'<section style="margin:20px[^"]*"><h2[^>]*>[^<]+</h2></section>')
+                sections = list(h2_pattern.finditer(html))
+
+                # Look for item_url in each section (try both exact and normalized match)
+                for i, match in enumerate(sections):
+                    section_start = match.start()
+                    section_end = match.end()
+                    # Determine section boundary
+                    if i + 1 < len(sections):
+                        next_start = sections[i + 1].start()
+                    else:
+                        next_start = len(html)
+
+                    section_html = html[section_end:next_start]
+                    # Try exact match first
+                    if item_url in section_html:
+                        # Check if this section already has an image
+                        if Pipeline._section_has_image(html, section_end, next_start):
+                            logger.debug(f"Section already has image, skipping screenshot for {item_url[:50]}...")
+                            return None
+                        # Insert at end of this section (before next h2 or end)
+                        return (next_start, section_start)
+
+                    # Try normalized match (extract URLs from section and normalize)
+                    url_pattern = re.compile(r'https?://[^\s"<>]+')
+                    for found_url in url_pattern.findall(section_html):
+                        if normalize_url(found_url) == normalized_target:
+                            if Pipeline._section_has_image(html, section_end, next_start):
+                                logger.debug(f"Section already has image, skipping screenshot for {item_url[:50]}...")
+                                return None
+                            return (next_start, section_start)
+
+                # Fallback: insert before first h2 if no match found
+                first_h2 = html.find('<section style="margin:20px')
+                if first_h2 > 0:
+                    # Check if area before first h2 already has images
+                    if Pipeline._section_has_image(html, 0, first_h2):
+                        logger.debug(f"Pre-h2 area already has images, skipping screenshot fallback for {item_url[:50]}...")
+                        return None
+                    return (first_h2, 0)
+                return None
+
+            # ========== Reddit Screenshots ==========
             reddit_urls = [url for url in links if "reddit.com" in url.lower()]
             if "reddit.com" in url_lower:
                 reddit_urls.insert(0, item.url)
@@ -1799,33 +1929,22 @@ class Pipeline:
                                     f'<img src="{wechat_url}" style="max-width:100%;border-radius:8px;" />'
                                     f'</section>'
                                 )
-                                # Insert after first paragraph (before first h2)
-                                first_h2 = article_html.find('<section style="margin:20px')
-                                if first_h2 > 0:
-                                    article_html = article_html[:first_h2] + img_html + "\n\n" + article_html[first_h2:]
+                                result = _find_insertion_pos(article_html, position_url or reddit_url)
+                                if result:
+                                    pos, _ = result
+                                    article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
                                 else:
-                                    first_p_end = article_html.find("</p>")
-                                    if first_p_end > 0:
-                                        article_html = article_html[:first_p_end + 4] + "\n\n" + img_html + article_html[first_p_end + 4:]
-                                logger.info(f"Inserted Reddit screenshot: {wechat_url}")
+                                    article_html += "\n" + img_html
+                                logger.info(f"Inserted Reddit screenshot near relevant section: {wechat_url[:50]}...")
                                 screenshot_inserted = True
-                        else:
-                            img_html = (
-                                f'<section style="text-align:center;margin:12px 0;">'
-                                f'<img src="{screenshot_path.as_posix()}" style="max-width:100%;border-radius:8px;" />'
-                                f'</section>'
-                            )
-                            first_h2 = article_html.find('<section style="margin:20px')
-                            if first_h2 > 0:
-                                article_html = article_html[:first_h2] + img_html + "\n\n" + article_html[first_h2:]
-                            screenshot_inserted = True
 
-            # ========== Twitter Screenshots (MANDATORY) ==========
+            # ========== Twitter Screenshots ==========
             if not screenshot_inserted and ("twitter.com" in url_lower or "x.com" in url_lower or item.source == "twitter"):
-                article_html = self._insert_twitter_screenshots(article_html, item)
+                # Use the twitter screenshot method but with better positioning
+                article_html = self._insert_twitter_screenshots(article_html, item, matched_url=position_url)
                 screenshot_inserted = True
 
-            # ========== HuggingFace Screenshots (MANDATORY) ==========
+            # ========== HuggingFace Screenshots ==========
             if not screenshot_inserted:
                 hf_urls = [url for url in links if "huggingface.co" in url.lower()]
                 if "huggingface.co" in url_lower:
@@ -1846,24 +1965,14 @@ class Pipeline:
                                         f'<img src="{wechat_url}" style="max-width:100%;border-radius:8px;" />'
                                         f'</section>'
                                     )
-                                    # Insert before reference links
-                                    ref_section = article_html.find('<section style="margin:24px')
-                                    if ref_section > 0:
-                                        article_html = article_html[:ref_section] + img_html + "\n\n" + article_html[ref_section:]
+                                    result = _find_insertion_pos(article_html, position_url or hf_url)
+                                    if result:
+                                        pos, _ = result
+                                        article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
                                     else:
-                                        article_html += "\n\n" + img_html
-                                    logger.info(f"Inserted HuggingFace screenshot: {wechat_url}")
+                                        article_html += "\n" + img_html
+                                    logger.info(f"Inserted HuggingFace screenshot near relevant section: {wechat_url[:50]}...")
                                     screenshot_inserted = True
-                            else:
-                                img_html = (
-                                    f'<section style="text-align:center;margin:12px 0;">'
-                                    f'<img src="{screenshot_path.as_posix()}" style="max-width:100%;border-radius:8px;" />'
-                                    f'</section>'
-                                )
-                                ref_section = article_html.find('<section style="margin:24px')
-                                if ref_section > 0:
-                                    article_html = article_html[:ref_section] + img_html + "\n\n" + article_html[ref_section:]
-                                screenshot_inserted = True
 
             if not screenshot_inserted:
                 logger.warning(f"No screenshot inserted for {item.source} item: {item.title[:50]}...")
