@@ -11,9 +11,13 @@
 """
 
 import re
+import json
+import subprocess
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, unquote, parse_qs
 from loguru import logger
+from src.minimax_mcp import MiniMaxMCPClient
+from src.utils.opencli_search import twitter_search as opencli_twitter_search
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -73,12 +77,12 @@ class NewsVerifier:
 
         # 按优先级逐级验证
         strategies = [
+            ("direct_url", lambda: self._check_existing_url(item, cfg)),
             ("website", lambda: self._search_official_website(item, cfg, company)),
             ("wechat", lambda: self._search_wechat(item, cfg, company)),
             ("twitter", lambda: self._search_official_twitter(item, cfg, company)),
             ("ceo_twitter", lambda: self._search_ceo_twitter(item, cfg, company)),
             ("model_lead_twitter", lambda: self._search_model_lead_twitter(item, cfg, company)),
-            ("direct_url", lambda: self._check_existing_url(item, cfg)),
         ]
 
         for name, strategy in strategies:
@@ -92,6 +96,15 @@ class NewsVerifier:
 
         logger.info(f"Could not verify official source for: {item.title[:50]}")
         return {"verified": False, "reason": "not_found"}
+
+    # ---- 高优先级 AI 工具/Agent 关键词 ----
+    # 这些工具的更新即使来自非官方渠道，也应被视为高质量内容
+    _HIGH_PRIORITY_TOOLS = [
+        "claude code", "claude-code", "codex", "openai codex",
+        "openclaw", "open claw", "hermes agent", "hermes",
+        "cursor", "cursor ide", "devin", "manus", "manus ai",
+        "github copilot", "copilot", "mcp", "model context protocol",
+    ]
 
     def _is_quality_discussion(self, item) -> bool:
         """判断是否为高质量的AI相关讨论帖（不需要公司验证）。"""
@@ -113,6 +126,27 @@ class NewsVerifier:
         has_ai_keyword = any(kw in combined_text for kw in ai_keywords)
         if not has_ai_keyword:
             return False
+
+        # 高优先级 AI 工具更新：直接通过（只要内容足够）
+        is_high_priority_tool = any(
+            kw in combined_text for kw in self._HIGH_PRIORITY_TOOLS
+        )
+        if is_high_priority_tool:
+            # 标题或内容中包含版本/更新关键词
+            update_keywords = [
+                "update", "release", "launch", "new version", "v2", "v3", "v4", "v5",
+                "发布", "更新", "新版本", "上线", "推出", "重大更新",
+                "changelog", "what's new", "announcing", "introducing",
+            ]
+            has_update_signal = any(kw in combined_text for kw in update_keywords)
+            full_text = title + " " + content
+            if has_update_signal and len(full_text) >= 50:
+                logger.info(f"High-priority tool update (auto-pass): {title[:50]}")
+                return True
+            # 即使没有明确更新信号，只要有实质内容也放行
+            if len(full_text) >= 100:
+                logger.info(f"High-priority tool discussion (auto-pass): {title[:50]}")
+                return True
 
         # 排除低质量内容
         low_quality_keywords = [
@@ -370,9 +404,13 @@ class NewsVerifier:
         """在指定推特账号中搜索相关推文。"""
         search_query = self._build_search_query(item, company)
 
-        # 先尝试 x.com 搜索
+        # 先尝试 OpenCLI 的 Twitter 搜索
+        results = self._opencli_twitter_search(account, search_query, max_results=3)
+
+        # 如果 OpenCLI Twitter 搜索失败，尝试 x.com / nitter 的通用 Web 搜索
         site_query = f"site:x.com/{account} {search_query}"
-        results = self._web_search(site_query, max_results=3)
+        if not results:
+            results = self._web_search(site_query, max_results=3)
 
         # 如果 x.com 搜索失败，尝试 nitter.net
         if not results:
@@ -398,6 +436,36 @@ class NewsVerifier:
             }
 
         return {"verified": False}
+
+    @staticmethod
+    def _opencli_twitter_search(account: str, search_query: str, max_results: int = 3) -> list[dict]:
+        """优先使用 OpenCLI 的 Twitter/X 搜索。"""
+        query = f"{account} {search_query}".strip()
+        try:
+            results = opencli_twitter_search(query, limit=max_results)
+        except Exception as e:
+            logger.debug(f"OpenCLI Twitter search failed: {e}")
+            return []
+
+        normalized: list[dict] = []
+        account_lower = account.lower()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url", "")
+            author = str(item.get("author", "")).lower()
+            if account_lower not in url.lower() and account_lower not in author:
+                continue
+            normalized.append({
+                "url": url,
+                "title": item.get("text", "") or item.get("title", ""),
+                "snippet": item.get("text", "") or item.get("title", ""),
+                "date": item.get("created_at", "") or item.get("date", ""),
+            })
+            if len(normalized) >= max_results:
+                break
+
+        return normalized
 
     @staticmethod
     def _fetch_tweet_images(tweet_url: str) -> list[str]:
@@ -507,9 +575,8 @@ class NewsVerifier:
                 publish_time = item_published_at.isoformat() if hasattr(item_published_at, 'isoformat') else str(item_published_at)
                 logger.debug(f"Freshness: using item published_at as fallback: {publish_time}")
             else:
-                # 完全没有时间信息，默认通过（今天爬到的内容本身就是新鲜的）
-                logger.info("Freshness check: no time info at all, accepting (today's crawl)")
-                return True
+                logger.info("Freshness check: no time info at all, rejecting")
+                return False
 
         try:
             # Strip microseconds from isoformat (e.g. 2026-04-28T21:53:15.345106+00:00)
@@ -567,9 +634,30 @@ class NewsVerifier:
         return parsed.netloc
 
     @staticmethod
-    def _web_search(query: str, max_results: int = 3) -> list[dict]:
-        """使用 DuckDuckGo 搜索。"""
+    def _web_search(query: str, max_results: int = 3, use_minimax: bool = False) -> list[dict]:
+        """优先使用 OpenCLI Google 搜索，失败后回退 DuckDuckGo。
+
+        OpenCLI 结果更贴近当前浏览器登录态和实时页面，适合优先做新闻/产品检索。
+        """
         try:
+            opencli_results = NewsVerifier._opencli_web_search(query, max_results=max_results)
+            if opencli_results:
+                merged = opencli_results
+                if use_minimax and len(opencli_results) < max_results:
+                    minimax_results = NewsVerifier._minimax_web_search(query, max_results=max_results)
+                    if minimax_results:
+                        seen = {r.get("url", "") for r in merged if r.get("url")}
+                        for item in minimax_results:
+                            url = item.get("url", "")
+                            if url and url in seen:
+                                continue
+                            merged.append(item)
+                            if url:
+                                seen.add(url)
+                            if len(merged) >= max_results:
+                                break
+                return merged[:max_results]
+
             import requests
             from bs4 import BeautifulSoup
 
@@ -605,9 +693,81 @@ class NewsVerifier:
                     if len(results) >= max_results:
                         break
 
-            return results
+            # 仅在明确请求且 DuckDuckGo 结果不足时才使用 MiniMax MCP
+            merged = results
+            if use_minimax and len(results) < max_results:
+                minimax_results = NewsVerifier._minimax_web_search(query, max_results=max_results)
+                if minimax_results:
+                    seen = {r.get("url", "") for r in merged if r.get("url")}
+                    for item in minimax_results:
+                        url = item.get("url", "")
+                        if url and url in seen:
+                            continue
+                        merged.append(item)
+                        if url:
+                            seen.add(url)
+                        if len(merged) >= max_results:
+                            break
+
+            return merged[:max_results]
         except Exception as e:
             logger.debug(f"Web search failed: {e}")
+            return []
+
+    @staticmethod
+    def _opencli_web_search(query: str, max_results: int = 3) -> list[dict]:
+        """Use OpenCLI Google search as the first-priority web search source."""
+        try:
+            proc = subprocess.run(
+                ["opencli", "google", "search", query, "--limit", str(max_results), "-f", "json"],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            if proc.returncode != 0:
+                logger.debug(f"OpenCLI search failed ({proc.returncode}): {(proc.stderr or proc.stdout or '').strip()}")
+                return []
+
+            output = (proc.stdout or "").strip()
+            if not output:
+                return []
+
+            data = json.loads(output)
+            if not isinstance(data, list):
+                data = [data]
+
+            results = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url", "")
+                title = item.get("title", "")
+                snippet = item.get("snippet", "")
+                if url:
+                    results.append({
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "date": item.get("date", ""),
+                    })
+                if len(results) >= max_results:
+                    break
+            return results
+        except FileNotFoundError:
+            logger.debug("opencli binary not found, skipping OpenCLI search")
+            return []
+        except Exception as e:
+            logger.debug(f"OpenCLI search failed: {e}")
+            return []
+
+    @staticmethod
+    def _minimax_web_search(query: str, max_results: int = 3) -> list[dict]:
+        try:
+            client = MiniMaxMCPClient()
+            return client.web_search(query, max_results=max_results)
+        except Exception as e:
+            logger.debug(f"MiniMax web search fallback failed: {e}")
             return []
 
     @staticmethod

@@ -13,6 +13,8 @@ from src.crawlers.huggingface_crawler import HuggingFaceCrawler
 from src.crawlers.modelscope_crawler import ModelScopeCrawler
 from src.crawlers.github_crawler import GitHubCrawler
 from src.crawlers.china_ai_crawler import ChinaAICrawler
+from src.crawlers.aihot_crawler import AIHotCrawler
+from src.crawlers.changelog_crawler import ChangelogCrawler
 from src.llm.client import LLMClient
 from src.pipeline import Pipeline
 from src.publish.wechat import WeChatPublisher
@@ -63,13 +65,16 @@ def build_crawlers(sources_config: dict) -> list:
         crawlers.append(GitHubCrawler(sources_config["github"]))
     if sources_config.get("china_ai", {}).get("enabled", False):
         crawlers.append(ChinaAICrawler(sources_config["china_ai"]))
+    if sources_config.get("aihot", {}).get("enabled", False):
+        crawlers.append(AIHotCrawler(sources_config["aihot"]))
+    if sources_config.get("changelog", {}).get("enabled", False):
+        crawlers.append(ChangelogCrawler(sources_config["changelog"]))
     return crawlers
 
 
 def build_live_crawlers(sources_config: dict) -> list:
-    """Build a conservative source set for real daily runs.
-
-    Default to the most stable source. Extra sources can be enabled with env vars:
+    """Build crawlers for daily-live mode — includes all sources.
+    Extra sources can be toggled with env vars:
     - DAILY_LIVE_INCLUDE_ARXIV=1
     """
     import os
@@ -77,6 +82,18 @@ def build_live_crawlers(sources_config: dict) -> list:
     crawlers = []
     if sources_config.get("github", {}).get("enabled", False):
         crawlers.append(GitHubCrawler(sources_config["github"]))
+    if sources_config.get("reddit", {}).get("enabled", False):
+        crawlers.append(RedditCrawler(sources_config["reddit"]))
+    if sources_config.get("twitter", {}).get("enabled", False):
+        crawlers.append(TwitterCrawler(sources_config["twitter"]))
+    if sources_config.get("huggingface", {}).get("enabled", False):
+        crawlers.append(HuggingFaceCrawler(sources_config["huggingface"]))
+    if sources_config.get("modelscope", {}).get("enabled", False):
+        crawlers.append(ModelScopeCrawler(sources_config["modelscope"]))
+    if sources_config.get("aihot", {}).get("enabled", False):
+        crawlers.append(AIHotCrawler(sources_config["aihot"]))
+    if sources_config.get("changelog", {}).get("enabled", False):
+        crawlers.append(ChangelogCrawler(sources_config["changelog"]))
     if os.environ.get("DAILY_LIVE_INCLUDE_ARXIV") == "1" and sources_config.get("arxiv", {}).get("enabled", False):
         crawlers.append(ArxivCrawler(sources_config["arxiv"]))
     return crawlers
@@ -102,6 +119,25 @@ def _extract_thumb_media_id_from_html(html: str) -> str:
     return ""
 
 
+def _prepare_article_html_for_draft(html: str, article_file: Path) -> str:
+    """Run final formatting repair for feature articles before draft upload."""
+    if article_file.name.startswith("feature_"):
+        body = re.sub(r"<!--\s*ARTICLE_TITLE:.*?-->\s*", "", html, flags=re.S)
+        body = re.sub(r"<!--\s*THUMB_MEDIA_ID:.*?-->\s*", "", body, flags=re.S)
+        repaired = Pipeline._clean_final_article_html(body)
+        repaired = Pipeline._ensure_lead_section(repaired, Pipeline._strip_html(repaired))
+        repaired = Pipeline._clean_final_article_html(repaired)
+        title = _extract_article_title_from_html(html)
+        thumb = _extract_thumb_media_id_from_html(html)
+        meta = []
+        if title:
+            meta.append(f"<!-- ARTICLE_TITLE: {title} -->")
+        if thumb:
+            meta.append(f"<!-- THUMB_MEDIA_ID: {thumb} -->")
+        return ("\n".join(meta) + "\n" + repaired).strip() if meta else repaired
+    return html
+
+
 def _upload_daily_draft(publisher: WeChatPublisher) -> bool:
     """Upload today's staged daily article to the WeChat draft box."""
     beijing_tz = timezone(timedelta(hours=8))
@@ -113,6 +149,7 @@ def _upload_daily_draft(publisher: WeChatPublisher) -> bool:
 
     try:
         html = article_file.read_text(encoding="utf-8")
+        html = _prepare_article_html_for_draft(html, article_file)
         title = _extract_article_title_from_html(html, fallback=article_file.stem)
         thumb_media_id = _extract_thumb_media_id_from_html(html)
         media_id = _retry_call(
@@ -143,6 +180,7 @@ def _upload_feature_drafts(publisher: WeChatPublisher) -> bool:
     for article_file in article_files:
         try:
             html = article_file.read_text(encoding="utf-8")
+            html = _prepare_article_html_for_draft(html, article_file)
             title = _extract_article_title_from_html(html, fallback=article_file.stem)
             thumb_media_id = _extract_thumb_media_id_from_html(html)
             media_id = _retry_call(
@@ -157,7 +195,7 @@ def _upload_feature_drafts(publisher: WeChatPublisher) -> bool:
             ok = True
         except Exception as e:
             logger.error(f"Failed to upload feature draft {article_file}: {e}")
-            return False
+            continue
 
     return ok
 
@@ -187,7 +225,12 @@ def mark_published():
         sys.exit(1)
 
     html = article_file.read_text(encoding="utf-8")
-    titles = re.findall(r'<h2 style="color:#1a1a2e[^"]*">([^<]+)</h2>', html)
+    titles = []
+    for title_html in re.findall(r'<h2\b[^>]*>(.*?)</h2>', html, flags=re.S | re.I):
+        title = re.sub(r"<[^>]+>", "", title_html)
+        title = re.sub(r"\s+", " ", title).strip()
+        if title:
+            titles.append(title)
 
     if not titles:
         print(f"文章中没有找到新闻标题")
@@ -205,7 +248,7 @@ def mark_published():
 def main():
     valid_modes = ("daily", "daily-live", "weekly", "test", "mark-published", "feature", "draft", "video")
     if len(sys.argv) < 2 or sys.argv[1] not in valid_modes:
-        print("Usage: python main.py <daily|daily-live|weekly|test|feature|draft|video|mark-published [date]>")
+        print("Usage: python main.py <daily|daily-live|weekly|test|feature|draft|video|mark-published [date]> [--debug] [--stage-only]")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -254,6 +297,7 @@ def main():
                 logger.error(f"Draft source not found: {article_file}")
                 continue
             html = article_file.read_text(encoding="utf-8")
+            html = _prepare_article_html_for_draft(html, article_file)
             title = _extract_article_title_from_html(html, fallback=article_file.stem)
             thumb_media_id = _extract_thumb_media_id_from_html(html)
             media_id = publisher.create_draft(
@@ -294,6 +338,7 @@ def main():
         return
 
     debug = "--debug" in sys.argv
+    stage_only = debug or "--stage-only" in sys.argv
 
     publisher = WeChatPublisher(wechat_config)
 
@@ -320,10 +365,14 @@ def main():
 
     if success:
         logger.info("Pipeline completed successfully")
+        if stage_only:
+            logger.info("Draft upload skipped; staged HTML is ready for review")
+            return
         # Force refresh access_token before upload to avoid expiration after long runs
         publisher._token = None
         publisher._token_expires = 0
         if mode == "feature":
+            logger.info("Feature drafts are uploaded incrementally as each article completes")
             if not _upload_feature_drafts(publisher):
                 logger.error("Feature draft upload failed")
                 sys.exit(1)

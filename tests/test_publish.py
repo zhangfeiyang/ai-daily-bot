@@ -107,3 +107,34 @@ def test_wechat_create_draft_normalizes_metadata_and_video(mock_get, mock_post):
     assert result == "draft_123"
     assert "ARTICLE_TITLE" not in mock_post.call_args.kwargs["data"].decode("utf-8")
     assert "video.example/demo.mp4" in mock_post.call_args.kwargs["data"].decode("utf-8")
+
+
+@patch("src.publish.wechat.requests.post")
+@patch("src.publish.wechat.requests.get")
+def test_wechat_upload_image_refreshes_invalid_token(mock_get, mock_post, tmp_path):
+    config = {"app_id": "wx123", "app_secret": "secret123"}
+    publisher = WeChatPublisher(config)
+
+    token_old = MagicMock()
+    token_old.json.return_value = {"access_token": "old", "expires_in": 7200}
+    token_old.raise_for_status = MagicMock()
+    token_new = MagicMock()
+    token_new.json.return_value = {"access_token": "new", "expires_in": 7200}
+    token_new.raise_for_status = MagicMock()
+    mock_get.side_effect = [token_old, token_new]
+
+    invalid = MagicMock()
+    invalid.json.return_value = {"errcode": 40001, "errmsg": "invalid credential"}
+    invalid.raise_for_status = MagicMock()
+    ok = MagicMock()
+    ok.json.return_value = {"url": "https://mmbiz.qpic.cn/image.png"}
+    ok.raise_for_status = MagicMock()
+    mock_post.side_effect = [invalid, ok]
+
+    img = tmp_path / "image.png"
+    img.write_bytes(b"fake image")
+
+    assert publisher.upload_image(str(img)) == "https://mmbiz.qpic.cn/image.png"
+    assert mock_get.call_count == 2
+    assert mock_post.call_count == 2
+    assert mock_post.call_args_list[1].kwargs["params"]["access_token"] == "new"

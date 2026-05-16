@@ -250,6 +250,13 @@ class Pipeline:
             if not published_at:
                 skipped += 1
                 continue
+            # Handle string dates from cache
+            if isinstance(published_at, str):
+                try:
+                    published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                except ValueError:
+                    skipped += 1
+                    continue
             if published_at.tzinfo is None:
                 published_at = published_at.replace(tzinfo=timezone.utc)
             if published_at >= cutoff:
@@ -259,6 +266,29 @@ class Pipeline:
         if skipped > 0:
             logger.info(f"Freshness gate dropped {skipped} stale/missing items")
         return fresh_items
+
+    def _format_datetime(self, dt) -> str:
+        """Format datetime to string, handling both datetime objects and ISO strings."""
+        if isinstance(dt, str):
+            try:
+                dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            except ValueError:
+                return dt
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _format_datetime_static(dt) -> str:
+        """Static version for use in static methods."""
+        if isinstance(dt, str):
+            try:
+                dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            except ValueError:
+                return dt
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
 
     def _is_ai_related(self, item) -> bool:
         """检查新闻是否与AI相关。"""
@@ -1166,6 +1196,7 @@ class Pipeline:
                 article_html, chinese_title, review_log = self._review_and_fix_article(
                     article_html, chinese_title, item
                 )
+                article_html = self._finalize_article_html(article_html, self._strip_html(article_html))
                 logger.info(
                     f"  Review: {review_log['iterations']} iteration(s), "
                     f"title_issues={len(review_log['title_issues'])}, "
@@ -1422,7 +1453,7 @@ class Pipeline:
             title=item.title,
             source=item.source,
             author=item.author,
-            date=item.published_at.strftime("%Y-%m-%d %H:%M"),
+            date=self._format_datetime(item.published_at),
             content=item.content[:3000],
             url=item.url,
         )
@@ -1498,7 +1529,7 @@ class Pipeline:
         # Clean meta-commentary and malformed headings from LLM output
         article_text = self._clean_llm_output(article_text)
 
-        article_html = self._markdown_to_html(article_text)
+        article_html = self._finalize_article_html(article_text, article_text)
 
         # Append reference links section
         ref_links = []
@@ -2783,6 +2814,10 @@ class Pipeline:
             except Exception as e:
                 logger.warning(f"Cover from news failed: {e}")
 
+        if not self.auto_image_generation:
+            logger.info("Auto image generation disabled, skipping generated cover")
+            return ""
+
         # 3. Try AI-generated cover image
         try:
             from src.image.generator import ImageGenerator
@@ -3206,7 +3241,7 @@ class Pipeline:
                     self._markdown_to_html(fixed_text), item.title
                 )
 
-            fixed_html = self._markdown_to_html(fixed_text)
+            fixed_html = self._finalize_article_html(fixed_text, fixed_text)
             return fixed_html, fixed_title
         except Exception as e:
             logger.warning(f"Article fix failed: {e}, returning original")
@@ -3267,7 +3302,7 @@ class Pipeline:
                 )
             parts.append(
                 f"【{i}】来源: {item.source} | 标题: {item.title}\n"
-                f"作者: {item.author} | 时间: {item.published_at.strftime('%Y-%m-%d %H:%M')}\n"
+                f"作者: {item.author} | 时间: {Pipeline._format_datetime_static(item.published_at)}\n"
                 f"链接: {item.url}\n"
                 f"内容: {content_excerpt}\n"
                 f"标签: {', '.join(item.tags) if item.tags else '无'}\n"
@@ -3492,14 +3527,429 @@ class Pipeline:
         return result.strip()
 
     @staticmethod
+    def _heading_html(content: str) -> str:
+        content = Pipeline._inline_md_to_html(content.strip())
+        return (
+            '<section style="margin:28px 0 14px 0;padding:14px 14px;'
+            'background:#f7f9fc;border-left:4px solid #e94560;border-radius:10px;">'
+            f'<h2 style="color:#1a1a2e;font-size:20px;line-height:1.5;margin:0;">{content}</h2>'
+            '</section>'
+        )
+
+    @staticmethod
+    def _render_lead_section(items: list[str]) -> str:
+        clean_items = []
+        for item in items:
+            item = Pipeline._plain_text(item)
+            item = re.sub(r'^[\-•\s]+', '', item).strip()
+            item = re.sub(r'\s+', ' ', item)
+            if not item or item in {"-", "—"} or "相关链接" in item:
+                continue
+            if item not in clean_items:
+                clean_items.append(item[:140])
+            if len(clean_items) >= 3:
+                break
+
+        if not clean_items:
+            return ""
+
+        rows = []
+        for item in clean_items:
+            rows.append(
+                '<div style="display:flex;gap:8px;align-items:flex-start;'
+                'margin:7px 0;color:#374151;font-size:14px;line-height:1.7;'
+                'border-left:3px solid #e94560;padding-left:8px;">'
+                f'{Pipeline._inline_md_to_html(item)}'
+                '</div>'
+            )
+        return (
+            '<section style="margin:0 0 28px 0;padding:16px 16px 14px 16px;'
+            'background:#f7f9fc;border:1px solid #e5edf8;border-radius:12px;">'
+            '<h1 style="color:#1a1a2e;font-size:20px;line-height:1.4;margin:0 0 10px 0;">导读</h1>'
+            + "".join(rows)
+            + '</section>'
+        )
+
+    @staticmethod
+    def _plain_text(value: str) -> str:
+        value = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
+        value = re.sub(r"</(?:p|div|section|h1|h2|li|blockquote)>", "\n", value, flags=re.I)
+        value = re.sub(r"<[^>]+>", "", value)
+        value = value.replace("&nbsp;", " ")
+        import html as html_lib
+        value = html_lib.unescape(value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _extract_lead_items(text: str) -> list[str]:
+        if not text:
+            return []
+        normalized = text.replace("&#8226;", "•").replace("&bull;", "•")
+        normalized = re.sub(r"<br\s*/?>", "\n", normalized, flags=re.I)
+        normalized = re.sub(r"</(?:p|div|section|li|h1|h2)>", "\n", normalized, flags=re.I)
+        normalized = re.sub(r"<[^>]+>", "", normalized)
+        import html as html_lib
+        normalized = html_lib.unescape(normalized)
+
+        labels = "一句话概括|核心看点|适合人群|最值得关注|几个关键数字|读完你会知道"
+        items: list[str] = []
+
+        def add_item(raw: str) -> None:
+            raw = re.sub(r'^[\-•\s]+', '', raw).strip()
+            raw = re.sub(r'\s+', ' ', raw)
+            if raw and "相关链接" not in raw and raw not in {"-", "—"} and raw not in items:
+                items.append(raw)
+
+        for line in normalized.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Split glued labels, e.g. 一句话概括：一核心看点：二适合人群：三
+            for match in re.finditer(
+                rf'({labels}|导读)[：:]\s*(.*?)(?=(?:{labels}|导读)[：:]|$)',
+                line,
+            ):
+                label = match.group(1)
+                value = match.group(2).strip()
+                value = re.split(r'\s{2,}|参考链接|相关链接', value, 1)[0].strip()
+                if value:
+                    if label == "导读":
+                        label = "一句话概括"
+                    add_item(f"{label}：{value}")
+            if len(items) >= 3:
+                break
+
+        return items[:3]
+
+    @staticmethod
+    def _remove_existing_lead_blocks(html: str) -> str:
+        html = re.sub(
+            r'^\s*<section\b[^>]*>\s*<h1\b[^>]*>\s*(?:<strong>)?\s*导读\s*(?:</strong>)?\s*</h1>.*?</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'\s*<p\b[^>]*>\s*(?:导读|一句话概括|核心看点|适合人群)[：:].*?</p>\s*',
+            '\n',
+            html,
+            flags=re.S | re.I,
+        )
+        return html
+
+    @staticmethod
+    def _ensure_lead_section(html: str, source_text: str = "") -> str:
+        """Ensure feature articles start with a styled lead card."""
+        if not html:
+            return html
+
+        lead_match = re.search(
+            r'<section\b[^>]*>\s*<h1\b[^>]*>\s*(?:<strong>)?\s*导读\s*(?:</strong>)?\s*</h1>(.*?)</section>',
+            html,
+            flags=re.S | re.I,
+        )
+        if lead_match:
+            existing_items = Pipeline._extract_lead_items(lead_match.group(0))
+            if len(existing_items) >= 2:
+                return html
+
+        items = Pipeline._extract_lead_items(html) or Pipeline._extract_lead_items(source_text)
+        body = Pipeline._remove_existing_lead_blocks(html)
+
+        if not items:
+            first_paragraph = ""
+            para_match = re.search(r'<p\b[^>]*>(.*?)</p>', body, flags=re.S | re.I)
+            if para_match:
+                first_paragraph = Pipeline._plain_text(para_match.group(1))[:70]
+            headings = [
+                Pipeline._plain_text(m.group(1))
+                for m in re.finditer(r'<h2\b[^>]*>(.*?)</h2>', body, flags=re.S | re.I)
+            ]
+            if first_paragraph:
+                items.append(f"一句话概括：{first_paragraph}")
+            if headings:
+                items.append("核心看点：" + "、".join(headings[:2]))
+            items.append("适合人群：AI 产品、技术和产业趋势关注者")
+
+        lead = Pipeline._render_lead_section(items)
+        return (lead + "\n" + body.lstrip()) if lead else html
+
+    @staticmethod
+    def _split_reference_candidates(text: str) -> list[str]:
+        if not text:
+            return []
+        text = re.sub(r'(?<=[A-Za-z0-9_.-])(?=(?:https?://|www\.))', ' ', text)
+        for domain in (
+            "github.com", "anthropic.com", "openai.com", "docs.", "x.com", "twitter.com",
+            "huggingface.co", "arxiv.org", "googleblog.com", "deepmind.google",
+            "research.google", "microsoft.com", "meta.com", "nvidia.com", "baike.sogou.com",
+        ):
+            text = re.sub(rf'(?<!/)(?<=[A-Za-z0-9_.-])(?={re.escape(domain)})', ' ', text)
+
+        urls = []
+        pattern = re.compile(r'(?:https?://)?(?:www\.)?[\w.-]+\.[a-z]{2,}(?:/[^\s<>"\']*)?', flags=re.I)
+        for match in pattern.finditer(text):
+            url = match.group(0).rstrip('.,;，。；、)')
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            if url not in urls:
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def _render_reference_links(urls: list[str]) -> str:
+        excluded_domains = {
+            "baidu.com", "baike.baidu.com", "baike.sogou.com", "sogou.com",
+            "3elife.net", "ithome.com", "douyin.com", "tiktok.com", "weibo.com",
+            "xiaohongshu.com", "bilibili.com", "youtube.com", "youtu.be",
+            "taobao.com", "tmall.com", "jd.com",
+        }
+
+        clean_urls = []
+        for raw in urls:
+            for url in Pipeline._split_reference_candidates(raw):
+                domain = urlparse(url).netloc.lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+                if any(domain == d or domain.endswith("." + d) for d in excluded_domains):
+                    continue
+                if url not in clean_urls:
+                    clean_urls.append(url)
+
+        if not clean_urls:
+            return ""
+
+        links = "\n".join(
+            f'<p style="color:#888;font-size:13px;margin:6px 0;line-height:1.6;">'
+            f'<a href="{url}" style="color:#888;text-decoration:none;word-break:break-all;">{url}</a></p>'
+            for url in clean_urls[:8]
+        )
+        return (
+            '<section style="margin:24px 0 8px 0;padding-top:8px;border-top:1px solid #eee;">'
+            '<p style="color:#666;font-size:13px;margin:0 0 6px 0;">相关链接</p>'
+            f'{links}</section>'
+        )
+
+    @staticmethod
+    def _looks_like_feature_heading(text: str) -> bool:
+        text = Pipeline._plain_text(text)
+        if not text or len(text) < 5 or len(text) > 34:
+            return False
+        if text.startswith(("参考", "来源", "作者", "时间", "链接", "一句话概括", "核心看点", "适合人群")):
+            return False
+        if re.search(r'[。；;！!]$', text):
+            return False
+        if re.match(r'^[\-•\d.、\s]+$', text):
+            return False
+        if re.search(r'https?://|www\.', text):
+            return False
+        return bool(re.search(r'[一-鿿A-Za-z0-9]', text))
+
+    @staticmethod
+    def _sanitize_article_html(html: str) -> str:
+        """Strip tags and attributes that WeChat drafts commonly drop or reject."""
+        html = re.sub(r'<(script|style|iframe)\b[^>]*>.*?</\1>', '', html or "", flags=re.S | re.I)
+        html = re.sub(r'\s+on\w+="[^"]*"', '', html, flags=re.I)
+        html = re.sub(r'\s+on\w+=\'[^\']*\'', '', html, flags=re.I)
+        try:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(html, "html.parser")
+            allowed_tags = {
+                "section", "div", "span", "h1", "h2", "p", "ul", "li", "blockquote",
+                "strong", "em", "code", "a", "img", "br", "mpvideo",
+            }
+            allowed_attrs = {
+                "style", "href", "src", "alt", "title", "data-original-url",
+                "data-section-title", "data-mpvid", "name", "controls",
+            }
+            for tag in list(soup.find_all(True)):
+                if tag.name not in allowed_tags:
+                    tag.unwrap()
+                    continue
+                for attr in list(tag.attrs):
+                    if attr not in allowed_attrs or attr.lower().startswith("on"):
+                        del tag.attrs[attr]
+                        continue
+                    if attr == "style":
+                        style = str(tag.attrs[attr])
+                        if "expression" in style.lower() or "javascript:" in style.lower():
+                            del tag.attrs[attr]
+                if tag.name == "a" and tag.get("href", "").lower().startswith("javascript:"):
+                    del tag.attrs["href"]
+                if tag.name == "img" and tag.get("src", "").lower().startswith("javascript:"):
+                    tag.decompose()
+            return str(soup)
+        except Exception:
+            return html
+
+    @staticmethod
+    def _clean_final_article_html(html: str) -> str:
+        """Repair common mixed Markdown/HTML artifacts before draft upload."""
+        if not html:
+            return html
+
+        html = html.strip()
+        html = re.sub(r'^```(?:html|markdown|md)?\s*', '', html, flags=re.I)
+        html = re.sub(r'\s*```$', '', html)
+        html = html.replace("&#8226;", "•")
+
+        fixed_lines = []
+        for line in html.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## <"):
+                fixed_lines.append(stripped[3:])
+            elif stripped in {"## 导读", "# 导读"}:
+                continue
+            elif stripped.startswith("## "):
+                fixed_lines.append(Pipeline._heading_html(stripped[3:]))
+            else:
+                fixed_lines.append(line)
+        html = "\n".join(fixed_lines)
+
+        html = re.sub(
+            r'<h2\b([^>]*)>\s*#+\s*(.*?)</h2>',
+            lambda m: f'<h2{m.group(1)}>{Pipeline._inline_md_to_html(m.group(2).strip())}</h2>',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'<p\b[^>]*>\s*#\s*([^<]{2,80})</p>',
+            lambda m: Pipeline._heading_html(m.group(1)),
+            html,
+            flags=re.S | re.I,
+        )
+
+        html = re.sub(
+            r'<section\b([^>]*)style="[^"]*color:#555[^"]*"[^>]*>\s*<p\b[^>]*>(.*?)</p>\s*</section>',
+            lambda m: (
+                '<p style="color:#555;font-size:13px;margin:6px 0 0 0;line-height:1.6;">'
+                f'{m.group(2)}</p>'
+            ),
+            html,
+            flags=re.S | re.I,
+        )
+
+        def replace_related(match: re.Match) -> str:
+            urls = []
+            for href in re.findall(r'href="([^"]+)"', match.group(0), flags=re.I):
+                urls.extend(Pipeline._split_reference_candidates(href))
+            urls.extend(Pipeline._split_reference_candidates(Pipeline._plain_text(match.group(0))))
+            return Pipeline._render_reference_links(urls)
+
+        html = re.sub(
+            r'<section\b[^>]*>\s*<p\b[^>]*>\s*相关链接\s*</p>.*?</section>',
+            replace_related,
+            html,
+            flags=re.S | re.I,
+        )
+
+        def replace_plain_heading(match: re.Match) -> str:
+            original = match.group(0)
+            if "font-size:13" in original or "color:#555" in original:
+                return original
+            text = Pipeline._plain_text(match.group(1))
+            if Pipeline._looks_like_feature_heading(text):
+                return Pipeline._heading_html(text)
+            return original
+
+        html = re.sub(r'<p\b[^>]*>(.*?)</p>', replace_plain_heading, html, flags=re.S | re.I)
+
+        # Repair lead cards whose three labels were glued into one row.
+        lead_items = Pipeline._extract_lead_items(html)
+        if lead_items and re.search(r'<h1\b[^>]*>\s*(?:<strong>)?\s*导读', html, flags=re.I):
+            body = Pipeline._remove_existing_lead_blocks(html)
+            html = Pipeline._render_lead_section(lead_items) + "\n" + body.lstrip()
+
+        html = re.sub(
+            r'<section>\s*-\s*<strong>一句话概括</strong>：.*?</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'<section>\s*-\s*\*\*一句话概括\*\*：.*?</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+
+        html = Pipeline._sanitize_article_html(html)
+        html = re.sub(r'\n{3,}', '\n\n', html)
+        return html.strip()
+
+    def _finalize_article_html(self, article: str, source_text: str = "") -> str:
+        """Normalize feature article output into WeChat-friendly HTML."""
+        if not article:
+            return article
+        if re.search(r'<(?:section|h1|h2|p|blockquote|ul|li|img|div)\b', article, flags=re.I):
+            html = article
+        else:
+            html = self._markdown_to_html(article)
+        html = self._clean_final_article_html(html)
+        html = self._ensure_lead_section(html, source_text or self._strip_html(html))
+        html = self._clean_final_article_html(html)
+        return html
+
+    def _insert_image_block_near_best_position(
+        self,
+        article_html: str,
+        image_url: str,
+        caption: str = "",
+        **_: object,
+    ) -> str:
+        image_block = (
+            '<section style="text-align:center;margin:12px 0;">'
+            f'<img src="{image_url}" style="max-width:100%;border-radius:8px;" />'
+        )
+        if caption:
+            image_block += (
+                f'<p style="color:#555;font-size:13px;margin:6px 0 0 0;line-height:1.6;">'
+                f'{self._inline_md_to_html(caption[:120])}</p>'
+            )
+        image_block += '</section>'
+
+        lead_end = article_html.find('</section>')
+        if lead_end != -1 and "导读" in article_html[:lead_end]:
+            pos = lead_end + len('</section>')
+            return article_html[:pos] + "\n" + image_block + "\n" + article_html[pos:]
+        first_p = article_html.find('<p')
+        pos = first_p if first_p != -1 else len(article_html)
+        return article_html[:pos] + "\n" + image_block + "\n" + article_html[pos:]
+
+    @staticmethod
     def _markdown_to_html(text: str) -> str:
         """将 LLM 输出的 Markdown 风格文本转为公众号友好的 HTML。"""
+        if not text:
+            return ""
+
+        text = text.strip()
+        text = re.sub(r'^```(?:html|markdown|md)?\s*', '', text, flags=re.I)
+        text = re.sub(r'\s*```$', '', text)
+        if re.search(r'<(?:section|h1|h2|p|blockquote|ul|li|img|div)\b', text, flags=re.I):
+            return Pipeline._clean_final_article_html(text)
+
         # 1. 处理 Markdown 链接 [text](url) → text：url（必须在 ** 处理之前）
         text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1：\2', text)
+        text = text.replace("&#8226;", "•").replace("&bull;", "•")
 
         # 2. 按行处理，先处理行内 Markdown 再组装 HTML
         lines = text.strip().split("\n")
         html_parts = []
+        lead_items: list[str] = []
+        in_lead = False
+        pending_reference_urls: list[str] = []
+        seen_heading = False
+
+        def flush_lead() -> None:
+            nonlocal lead_items
+            if lead_items:
+                lead_html = Pipeline._render_lead_section(lead_items)
+                if lead_html:
+                    html_parts.append(lead_html)
+                lead_items = []
 
         for line in lines:
             stripped = line.strip()
@@ -3512,48 +3962,109 @@ class Pipeline:
             if stripped.startswith("|") and stripped.endswith("|"):
                 continue
 
+            lead_title = re.sub(r'[*#\s]', '', stripped)
+            if lead_title == "导读":
+                in_lead = True
+                continue
+
+            if in_lead:
+                if not stripped:
+                    if lead_items:
+                        in_lead = False
+                        flush_lead()
+                        html_parts.append("")
+                    continue
+                if stripped.startswith("## ") or stripped.startswith("# ") or stripped.startswith("参考"):
+                    in_lead = False
+                    flush_lead()
+                else:
+                    candidate = re.sub(r'^[\-•*\s]+', '', stripped).strip()
+                    if candidate:
+                        lead_items.extend(Pipeline._extract_lead_items(candidate) or [candidate])
+                    continue
+
             # 参考链接行 — 渲染为极小的灰色链接
             if stripped.startswith("参考链接") or stripped.startswith("参考："):
+                flush_lead()
                 label_match = re.match(r'参考链接[：:]?\s*', stripped)
                 if label_match:
                     rest = stripped[label_match.end():]
                 else:
                     rest = stripped[3:].lstrip('：: ')
-                urls = re.findall(r'https?://\S+', rest)
-                if urls:
-                    # Each URL on its own line for readability
-                    url_links = "\n".join(
-                        f'<a href="{u}" style="color:#bbb;text-decoration:none;word-break:break-all;">{u}</a>'
-                        for u in urls
-                    )
-                    html_parts.append(
-                        f'<p style="color:#888;font-size:13px;margin:6px 0;line-height:1.6;">参考：<br/>{url_links}</p>'
-                    )
+                urls = Pipeline._split_reference_candidates(rest)
+                if seen_heading:
+                    rendered = Pipeline._render_reference_links(urls)
+                    if rendered:
+                        html_parts.append(rendered)
+                else:
+                    pending_reference_urls.extend(urls)
+                continue
+
+            bare_urls = Pipeline._split_reference_candidates(stripped)
+            if bare_urls and Pipeline._plain_text(stripped) == stripped and re.fullmatch(r'(?:https?://)?(?:www\.)?[\w.-]+\.[a-z]{2,}(?:/[^\s<>"\']*)?', stripped, flags=re.I):
+                pending_reference_urls.extend(bare_urls)
                 continue
 
             # 行内 Markdown → HTML（只对非标题行处理）
             if stripped.startswith("## "):
+                flush_lead()
                 content = Pipeline._inline_md_to_html(stripped[3:])
-                html_parts.append(f'<section style="margin:36px 0 12px 0;padding:16px 0 8px 0;border-top:1px solid #e94560;border-bottom:1px solid #eee;"><h2 style="color:#1a1a2e;font-size:18px;text-align:center;margin:0;">{content}</h2></section>')
+                if content.strip() != "相关链接":
+                    html_parts.append(Pipeline._heading_html(content))
+                    seen_heading = True
+                    if pending_reference_urls:
+                        rendered = Pipeline._render_reference_links(pending_reference_urls)
+                        if rendered:
+                            html_parts.append(rendered)
+                        pending_reference_urls = []
             elif stripped.startswith("# "):
                 content = Pipeline._inline_md_to_html(stripped[2:])
-                html_parts.append(f'<h1 style="color:#1a1a2e;font-size:22px;text-align:center;"><strong>{content}</strong></h1>')
+                if content.strip() == "导读":
+                    in_lead = True
+                else:
+                    flush_lead()
+                    html_parts.append(f'<h1 style="color:#1a1a2e;font-size:22px;text-align:center;"><strong>{content}</strong></h1>')
             elif stripped.startswith("- ") or stripped.startswith("* "):
+                flush_lead()
                 content = Pipeline._inline_md_to_html(stripped[2:])
                 html_parts.append(f'<p style="margin-left:16px;color:#333;">• {content}</p>')
             elif stripped == "":
                 html_parts.append("")
+            elif re.match(r'^\*\*[^*]{2,40}\*\*$', stripped) and "：" not in stripped:
+                flush_lead()
+                content = Pipeline._inline_md_to_html(stripped)
+                html_parts.append(Pipeline._heading_html(content))
+            elif stripped.startswith(("｜", ">")):
+                flush_lead()
+                content = Pipeline._inline_md_to_html(stripped.lstrip("｜> ").strip())
+                html_parts.append(
+                    '<blockquote style="margin:14px 0;padding:10px 14px;'
+                    'background:#f7f9fc;border-left:4px solid #1a73e8;color:#374151;line-height:1.7;">'
+                    f'{content}</blockquote>'
+                )
             else:
+                flush_lead()
                 content = Pipeline._inline_md_to_html(stripped)
                 html_parts.append(f'<p style="color:#333;line-height:1.8;margin:8px 0;">{content}</p>')
 
-        return "\n".join(html_parts)
+        flush_lead()
+        if pending_reference_urls:
+            rendered = Pipeline._render_reference_links(pending_reference_urls)
+            if rendered:
+                html_parts.append(rendered)
+        return Pipeline._clean_final_article_html("\n".join(html_parts))
 
     @staticmethod
     def _inline_md_to_html(text: str) -> str:
         """将单行内的 Markdown 格式转为 HTML，清理所有残留符号。"""
         # 成对的 **...** → <strong>
         text = re.sub(r'\*\*([^*\n]+?)\*\*', r'<strong>\1</strong>', text)
+        # 行内代码 `...` → <code>
+        text = re.sub(
+            r'`([^`\n]+?)`',
+            r'<code style="background:#f6f8fa;border-radius:4px;padding:1px 4px;color:#d6336c;">\1</code>',
+            text,
+        )
         # 成对的 *...* → <em>（但不要匹配 ** 里的）
         text = re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', r'<em>\1</em>', text)
         # 清理所有残留的 ** 或 *

@@ -7,7 +7,7 @@ from src.models import NewsItem
 
 
 class DummyCrawler(BaseCrawler):
-    def fetch(self):
+    def _fetch(self):
         return [
             NewsItem(
                 source="test",
@@ -82,33 +82,28 @@ def test_arxiv_crawler_fetch(mock_arxiv_mod):
         "max_results": 5,
         "sort_by": "submittedDate",
     })
+    crawler.cache_ttl_seconds = None
     items = crawler.fetch()
     assert len(items) == 1
     assert items[0].source == "arxiv"
 
 
 from src.crawlers.reddit_crawler import RedditCrawler
+from src.crawlers.aihot_crawler import AIHotCrawler
 
 
-@patch("src.crawlers.reddit_crawler.feedparser")
-@patch("src.crawlers.reddit_crawler.requests.get")
-def test_reddit_crawler_fetch(mock_get, mock_feedparser):
-    mock_get.return_value.status_code = 200
-    mock_get.return_value.text = "<rss>fake rss</rss>"
-    mock_get.return_value.raise_for_status = MagicMock()
-
-    mock_feedparser.parse.return_value = {
-        "entries": [
-            {
-                "title": "New breakthrough in LLM",
-                "link": "https://www.reddit.com/r/MachineLearning/comments/abc",
-                "summary": "Check out this new paper...",
-                "author": "/u/ml_researcher",
-                "published": "Fri, 18 Apr 2026 12:00:00 GMT",
-                "tags": [{"term": "Research"}],
-            }
-        ]
-    }
+@patch("src.crawlers.reddit_crawler.opencli_reddit_search")
+def test_reddit_crawler_fetch(mock_opencli_search):
+    mock_opencli_search.return_value = [
+        {
+            "title": "New breakthrough in LLM",
+            "subreddit": "MachineLearning",
+            "author": "ml_researcher",
+            "score": 321,
+            "comments": 42,
+            "url": "https://www.reddit.com/r/MachineLearning/comments/abc/new_breakthrough_in_llm/",
+        }
+    ]
 
     crawler = RedditCrawler({
         "enabled": True,
@@ -116,8 +111,74 @@ def test_reddit_crawler_fetch(mock_get, mock_feedparser):
         "sort": "hot",
         "limit": 10,
     })
+    crawler.cache_ttl_seconds = None
     items = crawler.fetch()
-    assert len(items) >= 1
+    assert len(items) == 1
     assert items[0].source == "reddit"
     assert items[0].title == "New breakthrough in LLM"
     assert items[0].author == "ml_researcher"
+    assert items[0].raw_data["reddit_score"] == 321
+    mock_opencli_search.assert_called_once()
+
+
+@patch("src.crawlers.reddit_crawler.opencli_reddit_search")
+def test_reddit_crawler_search_queries_use_opencli(mock_opencli_search):
+    mock_opencli_search.return_value = [
+        {
+            "title": "Open AI's Codex is going to kill Claude Code (finally)",
+            "subreddit": "vibecoding",
+            "author": "Conscious-Row-9936",
+            "score": 42,
+            "comments": 9,
+            "url": "https://www.reddit.com/r/vibecoding/comments/1stkj5v/open_ais_codex_is_going_to_kill_claude_code/",
+        }
+    ]
+
+    crawler = RedditCrawler(
+        {
+            "enabled": True,
+            "subreddits": [],
+            "search_queries": ["Codex"],
+            "limit": 1,
+            "max_age_hours": 72,
+        }
+    )
+    crawler.cache_ttl_seconds = None
+
+    items = crawler.fetch()
+
+    assert len(items) == 1
+    assert items[0].source == "reddit"
+    assert items[0].title.startswith("Open AI's Codex")
+    assert items[0].raw_data["subreddit"] == "vibecoding"
+    mock_opencli_search.assert_called_once()
+
+
+@patch("src.crawlers.aihot_crawler.requests.get")
+def test_aihot_crawler_fetches_rss(mock_get):
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.raise_for_status = MagicMock()
+    mock_get.return_value.text = """
+    <rss><channel>
+      <item>
+        <title>Symphony为每个任务启动运行Codex智能体</title>
+        <link>https://x.com/OpenAIDevs/status/2054252221941121035</link>
+        <description>OpenAI Developers update</description>
+        <pubDate>Fri, 15 May 2026 01:33:00 GMT</pubDate>
+        <category>OpenAI</category>
+      </item>
+    </channel></rss>
+    """
+
+    crawler = AIHotCrawler({
+        "feeds": ["https://aihot.virxact.com/feed.xml"],
+        "max_results": 5,
+        "max_age_hours": 48,
+    })
+    crawler.cache_ttl_seconds = None
+    items = crawler.fetch()
+
+    assert len(items) == 1
+    assert items[0].source == "aihot"
+    assert items[0].title == "Symphony为每个任务启动运行Codex智能体"
+    assert "OpenAI" in items[0].tags
