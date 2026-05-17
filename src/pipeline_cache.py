@@ -17,6 +17,7 @@ _BEIJING_TZ = timezone(timedelta(hours=8))
 _HISTORY_FILE_DAILY = Path("output/published_history_daily.json")
 _HISTORY_FILE_FEATURE = Path("output/published_history_feature.json")
 _IMAGE_CACHE_FILE = Path("output/image_cache.json")
+_MATERIAL_CACHE_FILE = Path("output/material_cache.json")
 
 # LLM客户端缓存（延迟初始化）
 _llm_client = None
@@ -242,3 +243,64 @@ def cache_image(title: str, local_path: str, wechat_url: str, cache: dict, names
         "date": today,
     }
     save_image_cache(cache)
+
+
+# ── 新闻材料持久缓存 ──
+
+def _stable_cache_key(namespace: str, value: str) -> str:
+    normalized = json.dumps(
+        {"namespace": namespace, "value": value},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def load_material_cache() -> dict:
+    """加载新闻材料持久缓存。永久保存，永不自动删除。"""
+    data = _load_json(_MATERIAL_CACHE_FILE)
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_material_cache(cache: dict):
+    _save_json(_MATERIAL_CACHE_FILE, cache)
+
+
+def get_material_cache(cache: dict, namespace: str, value: str):
+    key = _stable_cache_key(namespace, value)
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("payload")
+
+
+def set_material_cache(cache: dict, namespace: str, value: str, payload):
+    """保存材料到缓存。payload 包含原文、截图路径、生图路径、加工文等。"""
+    key = _stable_cache_key(namespace, value)
+    
+    # 如果已有缓存，尝试合并而不是覆盖（保留已有的截图或生图）
+    existing = cache.get(key)
+    if isinstance(existing, dict) and isinstance(existing.get("payload"), dict) and isinstance(payload, dict):
+        # 深度合并 payload
+        for k, v in payload.items():
+            if v: # 只覆盖非空值
+                existing["payload"][k] = v
+        existing["cached_at"] = datetime.now(_BEIJING_TZ).isoformat()
+    else:
+        cache[key] = {
+            "namespace": namespace,
+            "cached_at": datetime.now(_BEIJING_TZ).isoformat(),
+            "payload": payload,
+        }
+    save_material_cache(cache)
+
+
+def get_all_materials(cache: dict) -> list[dict]:
+    """返回所有已缓存的材料列表。"""
+    return [
+        {"key": k, **v}
+        for k, v in cache.items()
+        if isinstance(v, dict)
+    ]

@@ -47,7 +47,7 @@ class TwitterCrawler(BaseCrawler):
         "fantasy football", "super bowl", "playoff",
     ]
 
-    def fetch(self) -> list[NewsItem]:
+    def _fetch(self) -> list[NewsItem]:
         instances = self.config.get("nitter_instances", DEFAULT_INSTANCES)
         accounts = self.config.get("accounts", [])
         limit = self.config.get("limit", 20)

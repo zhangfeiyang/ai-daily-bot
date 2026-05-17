@@ -55,7 +55,8 @@ def test_upload_feature_drafts_uses_today_staged_articles(tmp_path, monkeypatch)
     publisher.create_draft.side_effect = ["media_1", "media_2"]
 
     assert main._upload_feature_drafts(publisher) is True
-    assert publisher.create_draft.call_count == 2
+    assert publisher.create_draft.call_count == 1
     assert publisher.create_draft.call_args_list[0].kwargs["title"] == "Draft One"
     assert publisher.create_draft.call_args_list[0].kwargs["thumb_media_id"] == "thumb_1"
-    assert publisher.create_draft.call_args_list[1].kwargs["title"] == "Draft Two"
+    assert "十字路口报道" in publisher.create_draft.call_args_list[0].kwargs["content"]
+    assert "【十字路口导读】" in publisher.create_draft.call_args_list[0].kwargs["content"]

@@ -57,8 +57,16 @@ class Composer:
         cmd = self._build_image_clip_command(material, segment, output_path, work_dir)
         self._run_ffmpeg(cmd, work_dir)
 
-    def _build_text_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> list[str]:
+    def _build_text_clip_command(
+        self,
+        material: VideoMaterial,
+        segment: VideoSegment,
+        output_path: Path,
+        work_dir: Path | None = None,
+    ) -> list[str]:
         """构建纯文字片段FFmpeg命令"""
+        work_dir = work_dir or output_path.parent
+        work_dir.mkdir(parents=True, exist_ok=True)
         duration = segment.duration or 5.0
         text_file = work_dir / f"text_{segment.id}.txt"
         text_file.write_text(segment.text, encoding="utf-8")
@@ -82,8 +90,16 @@ class Composer:
             str(output_path.absolute())
         ]
 
-    def _build_image_clip_command(self, material: VideoMaterial, segment: VideoSegment, output_path: Path, work_dir: Path) -> list[str]:
+    def _build_image_clip_command(
+        self,
+        material: VideoMaterial,
+        segment: VideoSegment,
+        output_path: Path,
+        work_dir: Path | None = None,
+    ) -> list[str]:
         """构建配图片段FFmpeg命令"""
+        work_dir = work_dir or output_path.parent
+        work_dir.mkdir(parents=True, exist_ok=True)
         duration = segment.duration or 5.0
         subtitle_path = work_dir / f"clip_{segment.id}.srt"
         if material.subtitle_srt != subtitle_path:

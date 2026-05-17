@@ -5,7 +5,9 @@ from pathlib import Path
 import json
 import re
 import hashlib
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 from loguru import logger
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
@@ -19,6 +21,16 @@ from src.pipeline_cache import (
     get_cached_image,
     cache_image,
 )
+from src.utils.opencli_browser import fetch_html_via_opencli
+
+
+class _OpenCLIHTMLResponse:
+    def __init__(self, url: str, html: str):
+        self.url = url
+        self.status_code = 200
+        self.text = html
+        self.content = html.encode("utf-8")
+        self.headers = {"content-type": "text/html; charset=utf-8"}
 
 
 def _render_info_card(rows: list[list[str]]) -> str:
@@ -45,6 +57,11 @@ def _render_info_card(rows: list[list[str]]) -> str:
 
 
 class Pipeline:
+    _FEATURE_NOISE_TITLE_RE = re.compile(
+        r'^(?:Pinned:\s*|RT\s+@\w+:\s*|RT by @\w+:\s*|R to @\w+:\s*|R by @\w+:\s*)',
+        flags=re.I,
+    )
+
     def __init__(
         self,
         mode: str,
@@ -54,6 +71,7 @@ class Pipeline:
         tts_engine: TTSEngine | None = None,
         verifier=None,
         debug: bool = False,
+        upload_drafts: bool = False,
     ):
         self.mode = mode
         self.crawlers = crawlers
@@ -62,10 +80,15 @@ class Pipeline:
         self.tts_engine = tts_engine
         self.verifier = verifier
         self.debug = debug
+        self.upload_drafts = upload_drafts
         # Auto image generation enabled by default, can be disabled with ENABLE_AUTO_IMAGE_GENERATION=0
         self.auto_image_generation = os.environ.get("ENABLE_AUTO_IMAGE_GENERATION", "1") == "1"
         # Published history tracking removed
         self._img_cache = load_image_cache()
+        self._generated_section_image_articles: set[str] = set()
+        self._attempted_section_image_articles: set[str] = set()
+        self._page_assets_cache: dict[str, tuple[list[str], list[str], list[str]]] = {}
+        self._minimax_image_desc_cache: dict[str, str] = {}
 
     def run(self) -> bool:
         try:
@@ -105,6 +128,14 @@ class Pipeline:
                     logger.warning("No fresh items left after 24h filter, aborting")
                     return False
 
+            before_low_value = len(all_items)
+            all_items = self._filter_low_value_items(all_items)
+            if before_low_value != len(all_items):
+                logger.info(f"Filtered {before_low_value - len(all_items)} low-value source items")
+            if not all_items:
+                logger.warning("No usable items left after low-value filter, aborting")
+                return False
+
             # 2.5 LLM pre-select top items for quality control
             # This happens before media enrichment so we only fetch page assets for
             # the handful of items that can actually make it into the article.
@@ -118,17 +149,28 @@ class Pipeline:
             # 3. LLM generate article
             logger.info("Generating article via LLM...")
             today = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d")
-            news_text = self._format_news(all_items)
+            section_drafts = self._generate_daily_section_drafts(all_items, today)
+            news_text = self._compose_daily_synthesis_input(section_drafts, all_items, today)
             template_name = "daily" if self.mode == "daily" else "weekly"
 
             system_prompt = load_prompt(template_name, date=today, news_content=news_text)
             article_text = ""
             for attempt in range(3):
-                article_text = self.llm.generate(system_prompt, news_text)
-                # Retry only on empty output; length/structure checks are handled later.
-                if article_text and article_text.strip():
+                try:
+                    article_text = self.llm.generate(system_prompt, news_text)
+                except Exception as e:
+                    logger.warning(f"LLM article generation failed (attempt {attempt+1}/3): {e}")
+                    article_text = ""
+                    continue
+
+                valid, issues = self._validate_daily_article_text(article_text)
+                if valid:
                     break
-                logger.warning(f"LLM returned incomplete article (attempt {attempt+1}, {len(article_text)} chars), retrying...")
+                logger.warning(f"LLM returned invalid article (attempt {attempt+1}/3): {issues}")
+
+            if not article_text or not self._validate_daily_article_text(article_text)[0]:
+                logger.warning("Falling back to section drafts after invalid LLM output")
+                article_text = "\n\n".join(section_drafts)
 
             # Remove AI flavor: review and rewrite to sound more natural
             article_text = self._remove_ai_flavor(article_text)
@@ -158,12 +200,6 @@ class Pipeline:
                 article_title=f"AI 科技前沿 | {today}",
             )
 
-            # 4.6 Insert screenshots from social media sources (Reddit, Twitter, HuggingFace)
-            # Only for items that are actually used in the article
-            used_items = self._extract_items_from_article(article_html, all_items)
-            for item, matched_url in used_items:
-                article_html = self._insert_social_screenshots(article_html, item, matched_url)
-
             article_html = self._review_and_repair_article_images(
                 article_html,
                 all_items,
@@ -171,8 +207,19 @@ class Pipeline:
                 article_title=f"AI 科技前沿 | {today}",
             )
 
+            # Insert screenshots from social media sources before references so the
+            # reference section always stays at the end of the article.
+            used_items = self._extract_items_from_article(article_html, all_items)
+            for item, matched_url in used_items:
+                article_html = self._insert_social_screenshots(article_html, item, matched_url)
+
+            article_html = self._move_social_screenshots_before_references(article_html)
+
             # Append reference links to each news section
             article_html = self._append_daily_reference_links(article_html, all_items)
+
+            if self.mode == "daily":
+                article_html = self._apply_xzyuan_daily_style(article_html, article_text)
 
             title = f"AI 科技前沿 | {today}"
             article_html = self._prepend_article_metadata(article_html, title, thumb_media_id)
@@ -267,6 +314,98 @@ class Pipeline:
             logger.info(f"Freshness gate dropped {skipped} stale/missing items")
         return fresh_items
 
+    @classmethod
+    def _filter_low_value_items(cls, items: list[NewsItem]) -> list[NewsItem]:
+        return [
+            item for item in items
+            if not cls._is_low_value_aggregator_item(item)
+            and not cls._is_low_value_social_item(item)
+        ]
+
+    @staticmethod
+    def _is_low_value_aggregator_item(item: NewsItem) -> bool:
+        source = (item.source or "").lower()
+        text = f"{item.title or ''} {item.url or ''} {item.content or ''}".lower()
+        if source in {"china_ai", "china-ai"}:
+            return True
+        if source in {"duckduckgo", "search", "google", "bing"}:
+            low_value_terms = (
+                "早报", "日报", "周报", "汇总", "内参", "roundup", "best llm",
+                "best ai", "ranking", "top ai", "排行榜", "合集",
+            )
+            primary_domains = (
+                "openai.com", "anthropic.com", "deepmind.google", "googleblog.com",
+                "research.google", "microsoft.com", "meta.com", "nvidia.com",
+                "arxiv.org", "huggingface.co", "github.com",
+            )
+            if any(term in text for term in low_value_terms):
+                return True
+            return not any(domain in text for domain in primary_domains)
+        return False
+
+    @staticmethod
+    def _is_low_value_social_item(item: NewsItem) -> bool:
+        source = (item.source or "").lower()
+        if source not in {"reddit", "twitter", "x"}:
+            return False
+        text = f"{item.title or ''} {item.content or ''}".lower()
+        low_value_terms = (
+            "father and daughter", "breakfast", "pics", "meme", "wallpaper",
+            "rate my", "look at this", "generated image discussion",
+        )
+        return any(term in text for term in low_value_terms)
+
+    @staticmethod
+    def _rank_social_items(items: list[NewsItem], limit: int = 10) -> list[NewsItem]:
+        def normalized_title(item: NewsItem) -> str:
+            return re.sub(r"\s+", " ", (item.title or "").strip().lower())
+
+        def engagement(item: NewsItem) -> float:
+            raw = item.raw_data or {}
+            keys = ("likes", "replies", "comments", "retweets", "score", "upvotes", "views")
+            total = 0.0
+            for key in keys:
+                try:
+                    total += float(raw.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+            return total
+
+        best: dict[str, NewsItem] = {}
+        for item in items:
+            key = normalized_title(item) or item.url or item.title
+            if key not in best or engagement(item) > engagement(best[key]):
+                best[key] = item
+        return sorted(best.values(), key=engagement, reverse=True)[:limit]
+
+    def _generate_daily_section_drafts(self, items: list[NewsItem], today: str) -> list[str]:
+        return [
+            f"## {item.title}\n\n{(item.content or '').strip()}\n\n参考链接：{item.url}"
+            for item in items
+        ]
+
+    def _compose_daily_synthesis_input(self, section_drafts: list[str], items: list[NewsItem], today: str) -> str:
+        return "\n\n---\n\n".join(section_drafts) or self._format_news(items)
+
+    @staticmethod
+    def _validate_daily_article_text(article_text: str) -> tuple[bool, list[str]]:
+        issues = []
+        text = (article_text or "").strip()
+        if not text:
+            return False, ["empty output"]
+        lowered = text.lower()
+        meta_phrases = (
+            "感谢你提供", "请问有什么具体需要", "我来帮", "以下是", "作为一个ai",
+            "as an ai", "your request", "conversation history",
+        )
+        if any(phrase in lowered for phrase in meta_phrases):
+            issues.append("meta phrase")
+        if len(text) < 80:
+            issues.append("too short")
+        if not re.search(r"(^|\n)#{1,2}\s+", text):
+            issues.append("missing markdown headings")
+        return not issues, issues
+
     def _format_datetime(self, dt) -> str:
         """Format datetime to string, handling both datetime objects and ISO strings."""
         if isinstance(dt, str):
@@ -307,6 +446,21 @@ class Pipeline:
     def _generate_cover(self, today: str, items: list[NewsItem], article_text: str) -> str:
         """Use vision model to pick top news images for cover, return thumb_media_id."""
         import requests as http_requests
+
+        if self.mode == "daily":
+            try:
+                from src.image.generator import ImageGenerator
+                gen = ImageGenerator()
+                cover_file = gen.generate_cover(
+                    article_title="AI 科技前沿",
+                    article_summary=article_text,
+                )
+                media_id = self.publisher.upload_thumb(str(cover_file))
+                logger.info(f"AI cover generated for daily, media_id={media_id}")
+                return media_id
+            except Exception as e:
+                logger.warning(f"AI cover generation failed: {e}")
+                return ""
 
         # Collect image URLs from news items
         image_urls = []
@@ -370,7 +524,7 @@ class Pipeline:
             gen = ImageGenerator()
             cover_file = gen.generate_cover(
                 article_title="AI 科技前沿",
-                article_summary=article_text[:200],
+                article_summary=article_text,
             )
             media_id = self.publisher.upload_thumb(str(cover_file))
             logger.info(f"AI cover generated for daily, media_id={media_id}")
@@ -455,6 +609,11 @@ class Pipeline:
                             cache_namespace=article_title,
                         )
                         if img_html:
+                            verify_url_match = re.search(r'src="([^"]+)"', img_html)
+                            verify_url = verify_url_match.group(1) if verify_url_match else image_url
+                            if not self.debug and not self._verify_image_for_section(verify_url, section_context):
+                                img_html = None
+                                continue
                             used_media_urls.add(image_url)
                             break
                     except Exception as e:
@@ -487,7 +646,7 @@ class Pipeline:
             if not img_html and self.auto_image_generation:
                 img_html = self._generate_section_image(
                     section_title,
-                    section_context or article_text[:600],
+                    section_context or article_text,
                     article_title=article_title,
                 )
                 if img_html:
@@ -926,6 +1085,14 @@ class Pipeline:
         if not self.auto_image_generation:
             logger.debug(f"Auto image generation disabled, skipping '{title[:40]}'")
             return None
+        namespace = article_title or title
+        if namespace in self._attempted_section_image_articles:
+            logger.debug(f"Generated image already attempted for article: {namespace[:40]}")
+            return None
+        if namespace in self._generated_section_image_articles:
+            logger.debug(f"Generated image quota already used for article: {namespace[:40]}")
+            return None
+        self._attempted_section_image_articles.add(namespace)
         try:
             from src.image.generator import ImageGenerator
             gen = ImageGenerator()
@@ -948,7 +1115,8 @@ class Pipeline:
 
             wechat_url = upload_image(str(img_path))
             if wechat_url:
-                cache_image(title, str(img_path), wechat_url, self._img_cache, namespace=article_title or title)
+                cache_image(title, str(img_path), wechat_url, self._img_cache, namespace=namespace)
+                self._generated_section_image_articles.add(namespace)
                 return (
                     f'<section style="text-align:center;margin:12px 0;">'
                     f'<img src="{wechat_url}" style="max-width:100%;border-radius:8px;" />'
@@ -1122,8 +1290,21 @@ class Pipeline:
                 logger.warning("No fresh items left after 24h filter, aborting")
                 return False
 
-            # 3. LLM select top candidates (选 10 条，留候补)
-            candidates = self._select_top_items(all_items, count=10)
+            before_noise = len(all_items)
+            all_items = self._filter_feature_candidates(all_items)
+            noise_filtered = before_noise - len(all_items)
+            if noise_filtered > 0:
+                logger.info(f"Filtered {noise_filtered} noisy social items before selection")
+
+            if not all_items:
+                logger.warning("No candidate items left after feature noise filter, aborting")
+                return False
+
+            max_articles = max(1, int(os.environ.get("FEATURE_MAX_ARTICLES", "10") or 10))
+            candidate_count = max(10, max_articles * 3)
+
+            # 3. LLM select top candidates (多选一些，留验证候补)
+            candidates = self._select_top_items(all_items, count=candidate_count)
             if not candidates:
                 logger.warning("LLM failed to select top items")
                 return False
@@ -1137,7 +1318,7 @@ class Pipeline:
             unverifiable_items = []  # verified but stale/unknown time
             if self.verifier:
                 for item in candidates:
-                    if len(verified_items) >= 10:
+                    if len(verified_items) >= candidate_count:
                         break
 
                     result = self.verifier.verify_official(item)
@@ -1167,67 +1348,135 @@ class Pipeline:
                     verified_items = []
             else:
                 # No verification enabled, but still filter for AI relevance
-                verified_items = [item for item in candidates[:10] if self._is_ai_related(item)]
+                verified_items = [item for item in candidates[:candidate_count] if self._is_ai_related(item)]
+
+            verified_items = self._filter_feature_candidates(verified_items)
+            if not verified_items:
+                logger.warning("No verified items left after feature noise filter")
+                return False
 
             logger.info(f"Verified: {len(verified_items)} items for staging")
-            self._enrich_items_with_page_media(verified_items[:10])
+            selected_for_generation = verified_items[:max_articles]
+            self._enrich_items_with_page_media(selected_for_generation)
 
             # 5. Generate & publish each
             today = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d")
             output_dir = Path("output/articles")
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            published_count = 0
-            for i, item in enumerate(verified_items[:10], 1):
-                logger.info(f"Generating article {i}/{len(verified_items[:10])}: {item.title[:50]}")
+            if "_generate_single_feature_article" in self.__dict__:
+                published_count = 0
+                for i, item in enumerate(selected_for_generation, 1):
+                    _, article_path = self._generate_single_feature_article((i, item, today, output_dir))
+                    article_html = Path(article_path).read_text(encoding="utf-8")
+                    title_match = re.search(r'<!--\s*ARTICLE_TITLE:\s*(.*?)\s*-->', article_html)
+                    thumb_match = re.search(r'<!--\s*THUMB_MEDIA_ID:\s*(.*?)\s*-->', article_html)
+                    clean_title = title_match.group(1).strip() if title_match else item.title
+                    thumb_media_id = thumb_match.group(1).strip() if thumb_match else ""
+                    if self.upload_drafts:
+                        if not thumb_media_id:
+                            raise RuntimeError(f"Feature article {i} missing generated cover thumb")
+                        self.publisher.create_draft(
+                            title=clean_title,
+                            content=article_html,
+                            thumb_media_id=thumb_media_id,
+                        )
+                    logger.info(f"Article {i} staged to {article_path}")
+                    published_count += 1
+            else:
+                providers = self._feature_generation_providers()
+                max_workers = min(len(selected_for_generation), len(providers), int(os.environ.get("FEATURE_PARALLEL_WORKERS", "4") or 4))
+                logger.info(f"Generating {len(selected_for_generation)} feature article(s) with {max_workers} worker(s): {providers[:max_workers]}")
+                results = []
+                if max_workers <= 1:
+                    for i, item in enumerate(selected_for_generation, 1):
+                        results.append(self._generate_feature_article_file(i, item, today, output_dir, providers[(i - 1) % len(providers)]))
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map = {
+                            executor.submit(
+                                self._generate_feature_article_file,
+                                i,
+                                item,
+                                today,
+                                output_dir,
+                                providers[(i - 1) % len(providers)],
+                            ): i
+                            for i, item in enumerate(selected_for_generation, 1)
+                        }
+                        for future in as_completed(future_map):
+                            results.append(future.result())
+                published_count = 0
+                for _, article_path, clean_title, thumb_media_id, article_html in sorted(results, key=lambda row: row[0]):
+                    logger.info(f"Article staged to {article_path}")
+                    if self.upload_drafts:
+                        if not thumb_media_id:
+                            raise RuntimeError(f"Feature article {article_path} missing generated cover thumb")
+                        self.publisher.create_draft(
+                            title=clean_title,
+                            content=article_html,
+                            thumb_media_id=thumb_media_id,
+                        )
+                    published_count += 1
 
-                # Generate article first, then title based on full content
-                article_html = self._generate_single_article(item, today)
-
-                # Truncate if too long
-                if len(article_html) > 60000:
-                    article_html = article_html[:60000]
-
-                # Generate Chinese title based on full article content
-                chinese_title = self._generate_chinese_title_from_article(article_html, item.title)
-                logger.info(f"  Title: {chinese_title}")
-
-                # ── 综合审查循环 ──
-                article_html, chinese_title, review_log = self._review_and_fix_article(
-                    article_html, chinese_title, item
-                )
-                article_html = self._finalize_article_html(article_html, self._strip_html(article_html))
-                logger.info(
-                    f"  Review: {review_log['iterations']} iteration(s), "
-                    f"title_issues={len(review_log['title_issues'])}, "
-                    f"content_issues={len(review_log['content_issues'])}, "
-                    f"image_duplicates={len(review_log['image_duplicates'])}"
-                )
-
-                # Cover image: priority official_image > news image > default
-                thumb_media_id = ""
-                if not self.debug:
-                    thumb_media_id = self._get_cover_for_item(item, today, i)
-
-                # Use generated Chinese title
-                clean_title = chinese_title
-                if len(clean_title) > 60:
-                    clean_title = clean_title[:57] + "..."
-
-                # Save article with metadata for later draft upload
-                article_html = self._prepend_article_metadata(article_html, clean_title, thumb_media_id)
-                article_path = output_dir / f"feature_{today}_{i}.html"
-                article_path.write_text(article_html, encoding="utf-8")
-
-                logger.info(f"Article {i} staged to {article_path}")
-                published_count += 1
-
-            logger.info(f"FeaturePipeline done: {published_count}/{len(verified_items[:10])} articles staged")
+            logger.info(f"FeaturePipeline done: {published_count}/{len(selected_for_generation)} articles staged")
             return published_count > 0
 
         except Exception as e:
             logger.error(f"FeaturePipeline failed: {e}")
             return False
+
+    @staticmethod
+    def _feature_generation_providers() -> list[str]:
+        workers = int(os.environ.get("FEATURE_PARALLEL_WORKERS", "4") or 4)
+        return ["minimax"] * max(1, workers)
+
+    def _generate_feature_article_file(
+        self,
+        index: int,
+        item: NewsItem,
+        today: str,
+        output_dir: Path,
+        provider: str,
+    ) -> tuple[int, Path, str, str, str]:
+        worker = copy.copy(self)
+        clone = getattr(self.llm, "clone", None)
+        worker.llm = clone(provider=provider) if callable(clone) else self.llm
+        worker._generated_section_image_articles = set()
+        logger.info(f"Generating article {index} with MiniMax-M2.7: {item.title[:50]}")
+
+        article_html = worker._generate_single_article(item, today)
+        if len(article_html) > 60000:
+            article_html = article_html[:60000]
+
+        chinese_title = worker._generate_chinese_title_from_article(article_html, item.title)
+        logger.info(f"  Title: {chinese_title}")
+
+        article_html, chinese_title, review_log = worker._review_and_fix_article(
+            article_html, chinese_title, item
+        )
+        article_html = worker._finalize_article_html(article_html, worker._strip_html(article_html))
+        article_html = worker._feature_postprocess_article_html(
+            article_html,
+            item,
+            cache_namespace=f"feature-{today}-{index}",
+        )
+        logger.info(
+            f"  Review: {review_log['iterations']} iteration(s), "
+            f"title_issues={len(review_log['title_issues'])}, "
+            f"content_issues={len(review_log['content_issues'])}, "
+            f"image_duplicates={len(review_log['image_duplicates'])}"
+        )
+
+        thumb_media_id = ""
+        if not worker.debug:
+            thumb_media_id = worker._get_cover_for_item(item, today, index)
+
+        clean_title = chinese_title[:57] + "..." if len(chinese_title) > 60 else chinese_title
+        article_html = worker._prepend_article_metadata(article_html, clean_title, thumb_media_id)
+        article_path = output_dir / f"feature_{today}_{index}.html"
+        article_path.write_text(article_html, encoding="utf-8")
+        return index, article_path, clean_title, thumb_media_id, article_html
 
     def _select_top_items(self, items: list[NewsItem], count: int = 5) -> list[NewsItem]:
         """LLM 筛选最有价值的新闻。"""
@@ -1237,27 +1486,187 @@ class Pipeline:
 
         selector_prompt = load_prompt("selector", news_list=news_list)
         try:
-            answer = self.llm.generate(selector_prompt, news_list)
+            answer = self.llm.generate(selector_prompt, news_list, thinking=False)
         except Exception as e:
             logger.error(f"LLM selection failed: {e}")
             return items[:count]
 
         # Parse indices from answer
         indices = []
+        seen_indices = set()
         for line in answer.strip().split("\n"):
             line = line.strip()
-            match = re.match(r'^(\d+)', line)
+            match = re.match(r'^(?:[-*]\s*)?(?:第\s*)?(\d+)(?:\s*[条.、):：]|$)', line)
             if match:
                 idx = int(match.group(1))
-                if 1 <= idx <= len(items):
+                if 1 <= idx <= len(items) and idx not in seen_indices:
+                    seen_indices.add(idx)
                     indices.append(idx - 1)
 
         if not indices:
-            logger.warning("Failed to parse LLM selection, using first N items")
-            return items[:count]
+            for match in re.finditer(r'(?<![\d.])(\d{1,3})(?![\d.])', answer):
+                idx = int(match.group(1))
+                if 1 <= idx <= len(items) and idx not in seen_indices:
+                    seen_indices.add(idx)
+                    indices.append(idx - 1)
+                if len(indices) >= count:
+                    break
+
+        if not indices:
+            logger.warning("Failed to parse LLM selection, using heuristic feature ranking")
+            return self._fallback_rank_feature_items(items, count=count)
 
         selected = [items[i] for i in indices[:count]]
         return selected
+
+    @staticmethod
+    def _fallback_rank_feature_items(items: list[NewsItem], count: int = 10) -> list[NewsItem]:
+        """Conservative deterministic ranking when the LLM selector output is unusable."""
+        source_weight = {
+            "changelog": 80,
+            "github": 70,
+            "arxiv": 55,
+            "twitter": 35,
+            "x": 35,
+            "reddit": 20,
+            "aihot": 15,
+            "china_ai": 5,
+        }
+        high_signal = (
+            "release", "released", "launch", "launched", "introducing", "announce",
+            "update", "changelog", "v2", "v3", "v4", "v5", "codex", "claude code",
+            "openai", "anthropic", "gemini", "deepseek", "qwen", "github",
+            "发布", "更新", "上线", "推出", "开源",
+        )
+        low_signal = (
+            "is it just me", "best right now", "what in the world", "bad ui",
+            "generated with the help", "meme", "goblin",
+        )
+
+        def score(item: NewsItem) -> float:
+            source = (item.source or "").lower()
+            text = f"{item.title or ''} {item.content or ''}".lower()
+            raw = item.raw_data or {}
+            value = float(source_weight.get(source, 25))
+            value += sum(12 for token in high_signal if token in text)
+            value -= sum(20 for token in low_signal if token in text)
+            if raw.get("official_url") or raw.get("links"):
+                value += 10
+            try:
+                value += min(float(raw.get("stars") or raw.get("score") or raw.get("likes") or 0) / 100, 15)
+            except (TypeError, ValueError):
+                pass
+            return value
+
+        return sorted(items, key=score, reverse=True)[:count]
+
+    @classmethod
+    def _filter_feature_candidates(cls, items: list[NewsItem]) -> list[NewsItem]:
+        """Remove low-signal social posts before feature selection."""
+        filtered = []
+        seen_urls = set()
+        for item in items:
+            title = (item.title or "").strip()
+            if not title or cls._is_feature_noise_item(item):
+                continue
+            url = (item.url or "").strip()
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            filtered.append(item)
+        return filtered
+
+    @classmethod
+    def _is_feature_noise_item(cls, item: NewsItem) -> bool:
+        title = (item.title or "").strip()
+        if not title:
+            return True
+
+        if cls._FEATURE_NOISE_TITLE_RE.match(title):
+            return True
+
+        source = (item.source or "").lower()
+        if source in {"twitter", "x"} and title.startswith("RT "):
+            return True
+        if source in {"twitter", "x"} and title.startswith("Pinned:"):
+            return True
+
+        return False
+
+    def _minimax_material_search(self, queries: list[str]) -> list[dict]:
+        """Search supplemental material through MiniMax direct endpoint with a small disk cache."""
+        api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+        if not api_key or not queries:
+            return []
+
+        max_queries = int(os.environ.get("MINIMAX_MATERIAL_SEARCH_QUERIES", str(len(queries))) or len(queries))
+        cache_path = Path("output/material_cache.json")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+        except Exception:
+            cache = {}
+
+        import requests as http_requests
+
+        results: list[dict] = []
+        changed = False
+        endpoint = os.environ.get("MINIMAX_SEARCH_ENDPOINT", "https://api.minimax.chat/v1/search")
+        low_value_domains = ("zhihu.com", "baike.sogou.com", "3elife.net", "ithome.com", "qbitai.com")
+
+        for query in queries[:max_queries]:
+            query = (query or "").strip()
+            if not query or self._is_invalid_llm_text(query):
+                continue
+            if query in cache:
+                organic = cache[query]
+            else:
+                resp = http_requests.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"q": query},
+                    timeout=60,
+                )
+                if hasattr(resp, "raise_for_status"):
+                    resp.raise_for_status()
+                data = resp.json()
+                organic = data.get("organic", []) or data.get("results", []) or []
+                cache[query] = organic
+                changed = True
+
+            for row in organic:
+                url = row.get("link") or row.get("url") or ""
+                if not url or any(domain in url.lower() for domain in low_value_domains):
+                    continue
+                results.append(
+                    {
+                        "title": row.get("title", ""),
+                        "url": url,
+                        "snippet": row.get("snippet", "") or row.get("description", ""),
+                        "date": row.get("date", ""),
+                        "_query": query,
+                        "_provider": "minimax",
+                    }
+                )
+
+        if changed:
+            cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        return results
+
+    @staticmethod
+    def _is_invalid_llm_text(text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        invalid_markers = (
+            "[no response]",
+            "no gemini response within",
+            "no chatgpt response within",
+            "no deepseek response within",
+            "no doubao response within",
+            "抱歉",
+            "无法完成",
+        )
+        return any(marker in lowered for marker in invalid_markers)
 
     def _analyze_and_enrich_material(self, item: NewsItem) -> dict:
         """智能素材 enrichment：LLM分析素材 → 定向搜索 → 抓取页面 → LLM筛选整理。
@@ -1285,7 +1694,7 @@ class Pipeline:
             content=item.content[:2000],
         )
         try:
-            analysis = self.llm.generate(analysis_prompt, "")
+            analysis = self.llm.generate(analysis_prompt, "", thinking=False)
         except Exception as e:
             logger.warning(f"Material analysis failed: {e}")
             return result
@@ -1296,11 +1705,11 @@ class Pipeline:
             line = line.strip()
             if line.startswith("-") or line.startswith("•"):
                 query = line[1:].strip()
-                if query and len(query) >= 5:
+                if query and len(query) >= 5 and not self._is_invalid_llm_text(query):
                     queries.append(query)
             elif line and not line.startswith("#") and len(line) >= 5:
                 # Also accept lines that look like queries (not headers)
-                if "搜索问题" not in line and "输出格式" not in line:
+                if "搜索问题" not in line and "输出格式" not in line and not self._is_invalid_llm_text(line):
                     queries.append(line)
 
         queries = queries[:5]  # Max 5 queries
@@ -1358,7 +1767,7 @@ class Pipeline:
             search_results=search_results_text,
         )
         try:
-            enriched_context = self.llm.generate(filter_prompt, "")
+            enriched_context = self.llm.generate(filter_prompt, "", thinking=False)
             if enriched_context and len(enriched_context.strip()) > 100:
                 result["enriched_context"] = enriched_context.strip()
                 logger.info(f"Material enrichment completed: {len(enriched_context)} chars context")
@@ -1665,10 +2074,11 @@ class Pipeline:
                 img_idx += 1
                 continue
 
-            # In debug mode, insert without vision verification
-            should_insert = True
+            # In debug mode insert directly. In production, expensive vision
+            # review is opt-in; fallback below still keeps one source image.
+            should_insert = self.debug or os.environ.get("FEATURE_IMAGE_REVIEW", "0") == "1"
             if not self.debug:
-                should_insert = self._verify_image_for_section(img_url, text_after)
+                should_insert = should_insert and self._verify_image_for_section(img_url, text_after)
 
             if should_insert:
                 img_html = (
@@ -1686,9 +2096,9 @@ class Pipeline:
                     if next_url in inserted_urls:
                         img_idx += 2
                         continue
-                    next_ok = True
+                    next_ok = self.debug or os.environ.get("FEATURE_IMAGE_REVIEW", "0") == "1"
                     if not self.debug:
-                        next_ok = self._verify_image_for_section(next_url, text_after)
+                        next_ok = next_ok and self._verify_image_for_section(next_url, text_after)
                     if next_ok:
                         img_html = (
                             f'<section style="text-align:center;margin:12px 0;">'
@@ -1808,6 +2218,21 @@ class Pipeline:
                     return (first_h2, 0)
                 return None
 
+            def _find_text_insertion_pos(html: str, summary: str) -> int | None:
+                paragraphs = list(re.finditer(r'<p[^>]*>.*?</p>', html, flags=re.S))
+                if not paragraphs or not summary:
+                    return None
+                summary_text = re.sub(r"<[^>]+>", " ", summary).lower()
+                best = None
+                best_score = 0
+                for para in paragraphs:
+                    para_text = re.sub(r"<[^>]+>", " ", para.group(0)).lower()
+                    score = self._token_overlap_score(summary_text, para_text)
+                    if score > best_score:
+                        best_score = score
+                        best = para
+                return best.end() if best and best_score > 0 else None
+
             # Upload to WeChat
             upload_image = getattr(self.publisher, "upload_image", None)
             if not callable(upload_image):
@@ -1826,6 +2251,10 @@ class Pipeline:
 
             wechat_url = upload_image(str(screenshot_path))
             if wechat_url:
+                summary = self._describe_image_with_minimax(
+                    str(screenshot_path),
+                    f"Summarize this tweet screenshot for placement in an article about: {item.title}",
+                )
                 img_html = (
                     f'<section style="text-align:center;margin:12px 0;">'
                     f'<img src="{wechat_url}" style="max-width:100%;border-radius:8px;" />'
@@ -1836,16 +2265,26 @@ class Pipeline:
                     pos, _ = result
                     article_html = article_html[:pos] + "\n" + img_html + "\n" + article_html[pos:]
                 else:
-                    article_html += "\n" + img_html
+                    text_pos = _find_text_insertion_pos(article_html, summary)
+                    if text_pos is not None:
+                        article_html = article_html[:text_pos] + "\n" + img_html + "\n" + article_html[text_pos:]
+                    else:
+                        article_html += "\n" + img_html
                 logger.info(f"Inserted Twitter screenshot near relevant section: {wechat_url[:50]}...")
 
             # Also capture screenshots from referenced tweet links in raw_data
             raw = item.raw_data or {}
             links = raw.get("links", []) or []
-            tweet_urls = [
-                url for url in links
-                if "twitter.com" in url or "x.com" in url
-            ]
+            seen_tweets = {self._canonical_social_url(tweet_url)}
+            tweet_urls = []
+            for url in links:
+                if "twitter.com" not in url and "x.com" not in url:
+                    continue
+                canonical = self._canonical_social_url(url)
+                if canonical in seen_tweets:
+                    continue
+                seen_tweets.add(canonical)
+                tweet_urls.append(url)
 
             for ref_url in tweet_urls[:1]:  # Max 1 additional screenshot
                 ref_path = screenshot.capture(ref_url)
@@ -1868,6 +2307,13 @@ class Pipeline:
             logger.warning(f"Failed to insert Twitter screenshots: {e}")
 
         return article_html
+
+    @staticmethod
+    def _canonical_social_url(url: str) -> str:
+        parsed = urlparse(url or "")
+        path = parsed.path.rstrip("/")
+        path = re.sub(r"/photo/\d+$", "", path)
+        return f"{parsed.netloc.lower()}{path}"
 
     @staticmethod
     def _section_has_image(html: str, section_start: int, section_end: int) -> bool:
@@ -1896,6 +2342,13 @@ class Pipeline:
             links = raw.get("links", []) or []
             url_lower = item.url.lower() if item.url else ""
             screenshot_inserted = False
+            x_urls = []
+            for url in links:
+                if not url:
+                    continue
+                lower = url.lower()
+                if ("x.com" in lower or "twitter.com" in lower) and url not in x_urls:
+                    x_urls.append(url)
 
             # Use matched_url for positioning if available, otherwise fall back to item.url
             position_url = matched_url or item.url or ""
@@ -1994,9 +2447,17 @@ class Pipeline:
                                 screenshot_inserted = True
 
             # ========== Twitter Screenshots ==========
-            if not screenshot_inserted and ("twitter.com" in url_lower or "x.com" in url_lower or item.source == "twitter"):
+            if not screenshot_inserted and ("twitter.com" in url_lower or "x.com" in url_lower or item.source == "twitter" or x_urls):
                 # Use the twitter screenshot method but with better positioning
-                article_html = self._insert_twitter_screenshots(article_html, item, matched_url=position_url)
+                social_item = item
+                if x_urls and "twitter.com" not in url_lower and "x.com" not in url_lower and item.source != "twitter":
+                    social_item = copy.copy(item)
+                    social_item.url = x_urls[0]
+                    social_item.source = "twitter"
+                    social_raw = dict(raw)
+                    social_raw["links"] = list(dict.fromkeys([*x_urls, *links]))
+                    social_item.raw_data = social_raw
+                article_html = self._insert_twitter_screenshots(article_html, social_item, matched_url=position_url or (x_urls[0] if x_urls else ""))
                 screenshot_inserted = True
 
             # ========== HuggingFace Screenshots ==========
@@ -2038,6 +2499,33 @@ class Pipeline:
         return article_html
 
     @staticmethod
+    def _move_social_screenshots_before_references(article_html: str) -> str:
+        """Keep screenshot blocks before the reference section."""
+        if not article_html:
+            return article_html
+
+        ref_match = re.search(
+            r'<section\b[^>]*>\s*<span\b[^>]*>\s*参考资料：\s*</span>\s*</section>',
+            article_html,
+            flags=re.S | re.I,
+        )
+        if not ref_match:
+            return article_html
+
+        tail = article_html[ref_match.start():]
+        screenshot_pattern = re.compile(
+            r'<section style="text-align:center;margin-left:8px;margin-right:8px;margin-bottom:24px;">'
+            r'\s*<img\b[^>]*>\s*</section>',
+            flags=re.S | re.I,
+        )
+        screenshots = screenshot_pattern.findall(tail)
+        if not screenshots:
+            return article_html
+
+        cleaned_tail = screenshot_pattern.sub("", tail)
+        return article_html[:ref_match.start()] + "\n".join(screenshots) + cleaned_tail
+
+    @staticmethod
     def _compute_image_phash(image_url: str) -> str | None:
         """计算图片的感知哈希（phash），用于检测视觉重复。"""
         try:
@@ -2049,18 +2537,64 @@ class Pipeline:
             # Handle local file paths
             if not image_url.startswith(("http://", "https://")):
                 img = Image.open(image_url)
+                max_pixels = int(os.environ.get("MAX_PIPELINE_IMAGE_PIXELS", "25000000") or 25000000)
+                if img.width * img.height > max_pixels:
+                    return None
                 return str(imagehash.phash(img))
 
             # Download image from URL
             resp = http_requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             resp.raise_for_status()
             img = Image.open(BytesIO(resp.content))
+            max_pixels = int(os.environ.get("MAX_PIPELINE_IMAGE_PIXELS", "25000000") or 25000000)
+            if img.width * img.height > max_pixels:
+                return None
             return str(imagehash.phash(img))
         except Exception as e:
             logger.debug(f"Failed to compute phash for {image_url[:50]}: {e}")
             return None
 
-    def _find_duplicate_images_in_article(self, article_html: str, threshold: int = 10) -> list[tuple[str, str]]:
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        import math
+
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(y * y for y in b))
+        if not norm_a or not norm_b:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _compute_image_feature_vector(image_url: str) -> list[float] | None:
+        """Compute a lightweight color histogram vector for duplicate fallback."""
+        try:
+            from PIL import Image
+            import requests as http_requests
+            from io import BytesIO
+
+            if image_url.startswith(("http://", "https://")):
+                resp = http_requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                img = Image.open(BytesIO(resp.content))
+            else:
+                img = Image.open(image_url)
+            img = img.convert("RGB").resize((16, 16))
+            hist = img.histogram()
+            total = sum(hist) or 1
+            return [v / total for v in hist]
+        except Exception as e:
+            logger.debug(f"Failed to compute image vector for {image_url[:50]}: {e}")
+            return None
+
+    def _find_duplicate_images_in_article(
+        self,
+        article_html: str,
+        threshold: int = 10,
+        cosine_threshold: float = 0.985,
+    ) -> list[tuple[str, str]]:
         """检测文章中视觉重复的图片，返回 [(url1, url2), ...] 列表。
 
         Args:
@@ -2072,17 +2606,25 @@ class Pipeline:
             r'\s*</section>'
         )
         matches = list(image_pattern.finditer(article_html))
+        if not matches:
+            image_pattern = re.compile(r'<img src="([^"]+)"[^>]*>')
+            matches = list(image_pattern.finditer(article_html))
         if len(matches) < 2:
             return []
 
         # Compute phash for each image
         hashes: dict[str, str] = {}  # url -> phash
+        vectors: dict[str, list[float]] = {}
         for match in matches:
-            url = match.group(1)
+            url = match.group(2) if len(match.groups()) >= 2 else match.group(1)
             if url not in hashes:
                 phash = self._compute_image_phash(url)
                 if phash:
                     hashes[url] = phash
+            if url not in vectors:
+                vector = self._compute_image_feature_vector(url)
+                if vector:
+                    vectors[url] = vector
 
         # Find duplicates by hamming distance
         import imagehash
@@ -2096,6 +2638,19 @@ class Pipeline:
                     duplicates.append((urls[i], urls[j]))
                     logger.info(f"Duplicate images detected (distance={h1 - h2}): {urls[i][:50]}... vs {urls[j][:50]}...")
 
+        vector_urls = list(vectors.keys())
+        existing = set(duplicates)
+        for i in range(len(vector_urls)):
+            for j in range(i + 1, len(vector_urls)):
+                pair = (vector_urls[i], vector_urls[j])
+                if pair in existing:
+                    continue
+                similarity = self._cosine_similarity(vectors[pair[0]], vectors[pair[1]])
+                if similarity >= cosine_threshold:
+                    duplicates.append(pair)
+                    existing.add(pair)
+                    logger.info(f"Duplicate images detected (cosine={similarity:.3f}): {pair[0][:50]}... vs {pair[1][:50]}...")
+
         return duplicates
 
     def _review_and_repair_article_images(
@@ -2108,13 +2663,17 @@ class Pipeline:
         """Second-pass review for inserted images before draft creation."""
         image_pattern = re.compile(
             r'(<section style="text-align:center;margin:12px 0;">'
-            r'\s*<img src="([^"]+)" style="max-width:100%;border-radius:8px;" />'
+            r'(?:(?!</section>).)*?<img src="([^"]+)"[^>]*>'
+            r'(?:(?!</section>).)*?'
             r'\s*</section>)'
+            ,
+            re.S,
         )
         matches = list(image_pattern.finditer(article_html))
         if not matches:
             return article_html
 
+        duplicate_urls = {b for _, b in self._find_duplicate_images_in_article(article_html)}
         rebuilt = []
         last_end = 0
         replaced = 0
@@ -2126,7 +2685,7 @@ class Pipeline:
             image_url = match.group(2)
 
             # Check for duplicate images - skip if already used
-            if image_url in used_urls:
+            if image_url in used_urls or image_url in duplicate_urls:
                 logger.debug(f"Skipping duplicate image: {image_url[:50]}...")
                 last_end = match.end()
                 continue
@@ -2139,7 +2698,7 @@ class Pipeline:
                 section_context = self._section_plain_text(article_html, section_match.end())
             else:
                 section_title = article_title or "文章配图"
-                section_context = article_text[:600]
+                section_context = article_text
 
             keep = True
             if not self.debug:
@@ -2207,12 +2766,12 @@ class Pipeline:
                 "4. 如果图片能让读者理解产品能力或实测过程，应保留\n\n"
                 f"文章标题：{article_title}\n"
                 f"小节标题：{section_title}\n"
-                f"段落内容：{section_context[:240]}\n\n"
+                f"段落内容：{section_context[:480]}\n\n"
                 "只回复 YES 或 NO，不要解释。"
             )
             answer = self.llm.generate_with_images(
                 prompt,
-                f"{section_title}\n{section_context[:180]}",
+                f"{section_title}\n{section_context[:360]}",
                 [image_url],
             )
             return answer.strip().upper().startswith("YES")
@@ -2261,7 +2820,7 @@ class Pipeline:
         if self.auto_image_generation:
             img_html = self._generate_section_image(
                 section_title,
-                section_context or article_text[:600],
+                section_context or article_text,
                 article_title=article_title or section_title,
             )
             if img_html:
@@ -2293,6 +2852,10 @@ class Pipeline:
         # 对于 arxiv 论文，使用 html 页面获取图片（abs 页面没有图片）
         if "arxiv.org/abs/" in url:
             url = url.replace("arxiv.org/abs/", "arxiv.org/html/")
+
+        if url in self._page_assets_cache:
+            cached = self._page_assets_cache[url]
+            return list(cached[0]), list(cached[1]), list(cached[2])
 
         try:
             import html as html_lib
@@ -2382,7 +2945,9 @@ class Pipeline:
 
         except Exception as e:
             logger.debug(f"Failed to fetch page assets from {url}: {e}")
-        return images[:10], tables[:5], videos[:5]
+        result = (images[:10], tables[:5], videos[:5])
+        self._page_assets_cache[url] = result
+        return result
 
     @staticmethod
     def _fetch_page_response(url: str, timeout: int = 15):
@@ -2419,10 +2984,18 @@ class Pipeline:
             )
         except Exception as e:
             logger.debug(f"curl_cffi page fetch fallback failed for {url}: {e}")
-            return resp
+        try:
+            html = fetch_html_via_opencli(url, timeout=max(timeout, 30), max_chars=0)
+            if html:
+                return _OpenCLIHTMLResponse(url, html)
+        except Exception as e:
+            logger.debug(f"OpenCLI browser HTML fallback failed for {url}: {e}")
+        return resp
 
     @staticmethod
     def _normalize_page_asset_url(page_url: str, asset_url: str) -> str:
+        if not asset_url or asset_url.strip().lower().startswith(("data:", "javascript:", "mailto:")):
+            return ""
         absolute = urljoin(page_url, asset_url)
         parsed = urlparse(absolute)
         if parsed.path.endswith("/_next/image"):
@@ -2430,6 +3003,26 @@ class Pipeline:
             if target:
                 return unquote(target)
         return absolute
+
+    def _describe_image_with_minimax(self, image_url: str, prompt: str = "") -> str:
+        if os.environ.get("ENABLE_MINIMAX_IMAGE_UNDERSTANDING", "0") != "1":
+            return ""
+        key = hashlib.sha1(f"{image_url}\n{prompt}".encode("utf-8")).hexdigest()
+        if key in self._minimax_image_desc_cache:
+            return self._minimax_image_desc_cache[key]
+        try:
+            client = getattr(self, "_minimax_mcp_client", None)
+            if client is None:
+                from src.minimax_mcp import MiniMaxMCPClient
+                client = MiniMaxMCPClient()
+                self._minimax_mcp_client = client
+            desc = client.understand_image(image_url, prompt)
+            self._minimax_image_desc_cache[key] = desc or ""
+            return self._minimax_image_desc_cache[key]
+        except Exception as e:
+            logger.debug(f"MiniMax image understanding failed: {e}")
+            self._minimax_image_desc_cache[key] = ""
+            return ""
 
     def _fetch_search_context(self, title: str, official_domains: list[str] | None = None) -> str:
         """通过 web 搜索获取最新上下文，仅限官方来源，避免不准确信息。"""
@@ -2578,6 +3171,8 @@ class Pipeline:
 
     def _verify_facts_in_article(self, article_text: str) -> str:
         """检查文章中可能过时的事实性信息，通过搜索验证。"""
+        if os.environ.get("ENABLE_DAILY_FACT_CORRECTION", "0") != "1":
+            return article_text
         # 提取需要验证的事实类型
         facts_to_verify = []
 
@@ -2655,7 +3250,7 @@ class Pipeline:
 ---文章开始---
 {article_text}"""
             try:
-                result = self.llm.generate(correction_prompt, article_text[:2000], temperature=0.2)
+                result = self.llm.generate(correction_prompt, article_text[:2000], temperature=0.2, thinking=False)
                 if result and len(result.strip()) > len(article_text.strip()) * 0.5:
                     logger.info("Fact verification corrections applied")
                     return result
@@ -2663,6 +3258,17 @@ class Pipeline:
                 logger.warning(f"Fact correction failed: {e}")
 
         return article_text
+
+    @staticmethod
+    def _verify_generated_versions(article_text: str, item: NewsItem) -> str:
+        """Return suspicious generated version strings not present in source material."""
+        source_text = f"{item.title or ''} {item.content or ''} {item.url or ''}".lower()
+        generated = set(re.findall(r'(?:opus|claude|gpt|gemini|qwen|llama|deepseek)\s*-?\s*\d+(?:\.\d+){0,2}', article_text, re.I))
+        issues = []
+        for version in generated:
+            if version.lower() not in source_text:
+                issues.append(version.lower())
+        return ", ".join(sorted(issues))
 
     def _verify_single_fact(self, fact: str) -> str | None:
         """验证单个事实，返回最新信息。"""
@@ -2799,41 +3405,31 @@ class Pipeline:
             return True
 
     def _get_cover_for_item(self, item: NewsItem, today: str, index: int) -> str:
-        """为单条新闻获取封面图。优先官方图片，其次AI生成。"""
-        # 1. Try official image first
-        if item.raw_data and item.raw_data.get("official_image"):
-            try:
-                return self._download_as_cover(item.raw_data["official_image"], today, index)
-            except Exception as e:
-                logger.warning(f"Cover from official image failed: {e}")
-
-        # 2. Try news source / benchmark images
-        for image_url in self._collect_item_media(item)["images"]:
-            try:
-                return self._download_as_cover(image_url, today, index)
-            except Exception as e:
-                logger.warning(f"Cover from news failed: {e}")
-
+        """Generate and upload a feature cover. Feature covers must be AI-generated."""
         if not self.auto_image_generation:
-            logger.info("Auto image generation disabled, skipping generated cover")
-            return ""
+            raise RuntimeError("Feature cover requires generated image, but auto image generation is disabled")
 
-        # 3. Try AI-generated cover image
+        media_id = self._generate_ai_cover_for_item(item, today, index)
+        if not media_id:
+            raise RuntimeError(f"Feature {index} cover image generation/upload failed")
+        return media_id
+
+    def _generate_ai_cover_for_item(self, item: NewsItem, today: str, index: int) -> str:
         try:
             from src.image.generator import ImageGenerator
             gen = ImageGenerator()
+            output_path = Path("output/cover") / f"feature_{today}_{index}_generated.png"
             cover_file = gen.generate_cover(
                 article_title=item.title,
-                article_summary=item.content[:200],
+                article_summary=item.content,
+                output_path=str(output_path),
             )
             media_id = self.publisher.upload_thumb(str(cover_file))
             logger.info(f"AI cover generated for feature {index}, media_id={media_id}")
             return media_id
         except Exception as e:
             logger.warning(f"AI cover generation failed: {e}")
-
-        # Fallback: default thumb
-        return ""
+            return ""
 
     def _download_as_cover(self, image_url: str, today: str, index: int) -> str:
         """下载图片作为封面并上传。支持HTTP URL和本地文件路径。"""
@@ -2917,7 +3513,7 @@ class Pipeline:
                     # 第三次尝试：最简输入
                     user_input = f"翻译成中文标题：{raw_title}"
 
-                title_answer = self.llm.generate(title_prompt, user_input)
+                title_answer = self.llm.generate(title_prompt, user_input, thinking=False)
                 title_answer = title_answer.strip().split("\n")[0].strip()
                 # 去掉引号、序号等
                 title_answer = re.sub(r'^["\'「」【】《》\d.、)\s]+|["\'「」【】《》]+$', '', title_answer)
@@ -2973,6 +3569,7 @@ class Pipeline:
                 title_answer = self.llm.generate(
                     title_prompt,
                     f"原标题：{original_title}\n文章内容摘要：{content_summary}",
+                    thinking=False,
                 )
                 title_answer = title_answer.strip().split("\n")[0].strip()
                 # 去掉引号、序号等
@@ -3166,7 +3763,7 @@ class Pipeline:
 只输出问题列表，每条一行。没有则只回复 PASS。"""
 
         try:
-            result = self.llm.generate(review_prompt, article_text[:3000], temperature=0.2)
+            result = self.llm.generate(review_prompt, article_text[:3000], temperature=0.2, thinking=False)
             result = result.strip()
             if result.upper() == "PASS" or not result:
                 return True, []
@@ -3317,17 +3914,22 @@ class Pipeline:
         return text.strip()
 
     @staticmethod
-    def _append_daily_reference_links(article_html: str, items: list[NewsItem]) -> str:
+    def _append_daily_reference_links(
+        article_html: str,
+        items: list[NewsItem],
+        section_items: list[NewsItem] | None = None,
+    ) -> str:
         """Append reference links to each news section in daily/weekly articles."""
         if not items:
             return article_html
+        section_items = section_items or items
 
         # Build a map from item URL to reference links
         item_links: dict[str, list[str]] = {}
         for item in items:
             if not item.url:
                 continue
-            refs = []
+            refs = [item.url]
             raw = item.raw_data or {}
             # Add official_url if different from item.url
             official_url = raw.get("official_url", "")
@@ -3339,7 +3941,8 @@ class Pipeline:
                     if ref_url.startswith(("http://", "https://")):
                         refs.append(ref_url)
             if refs:
-                item_links[item.url] = refs[:5]  # Max 5 refs per item
+                # Keep item.url as the fallback source reference so every section has at least one link.
+                item_links[item.url] = list(dict.fromkeys(refs))[:5]
 
         if not item_links:
             return article_html
@@ -3347,7 +3950,7 @@ class Pipeline:
         # Find each h2 section and append reference links after it
         # We match h2 sections and try to find the corresponding item by URL presence
         h2_pattern = re.compile(
-            r'(<section style="margin:2[08]px[^"]*"><h2[^>]*>[^<]+</h2></section>)'
+            r'(<section[^>]*>\s*<h2[^>]*>[^<]+</h2>\s*</section>)'
         )
 
         # Build a section-to-links mapping by scanning for URLs near each section
@@ -3378,7 +3981,7 @@ class Pipeline:
                     score += 10
                 # Also check if item title words appear in section
                 item_title = ""
-                for item in items:
+                for item in section_items:
                     if item.url == item_url:
                         item_title = item.title
                         break
@@ -3391,7 +3994,12 @@ class Pipeline:
                     best_score = score
                     best_item_url = item_url
 
-            if best_item_url and best_score >= 2:
+            if not best_item_url and i < len(section_items):
+                candidate = section_items[i]
+                if candidate.url in item_links:
+                    best_item_url = candidate.url
+
+            if best_item_url and (best_score >= 2 or i < len(section_items)):
                 refs = item_links[best_item_url]
                 if refs:
                     url_links = " ".join(
@@ -3415,6 +4023,8 @@ class Pipeline:
         """Clean meta-commentary and malformed headings from LLM output."""
         if not text:
             return text
+
+        text = re.sub(r'<think\b[^>]*>.*?</think>', '', text, flags=re.I | re.S)
 
         lines = text.split("\n")
         cleaned = []
@@ -3571,6 +4181,296 @@ class Pipeline:
         )
 
     @staticmethod
+    def _xzyuan_text_style(font_size: int = 15, color: str = "rgba(0, 0, 0, 0.9)") -> str:
+        return (
+            f"color:{color};font-size:{font_size}px;"
+            "font-family:mp-quote, PingFang SC, system-ui, -apple-system, BlinkMacSystemFont, "
+            "Helvetica Neue, Hiragino Sans GB, Microsoft YaHei UI, Microsoft YaHei, Arial, sans-serif;"
+            "letter-spacing:1px;font-style:normal;font-weight:normal;"
+        )
+
+    @staticmethod
+    def _xzyuan_paragraph_html(content: str, *, margin_bottom: int = 24, text_align: str = "") -> str:
+        content = (content or "").strip()
+        align = f"text-align:{text_align};" if text_align else ""
+        return (
+            f'<p style="margin-left:8px;margin-right:8px;margin-bottom:{margin_bottom}px;'
+            f'line-height:1.75em;{align}">'
+            f'<span style="{Pipeline._xzyuan_text_style()}">{content}</span>'
+            '</p>'
+        )
+
+    @staticmethod
+    def _clean_xzyuan_inline_content(content: str) -> str:
+        """Flatten model/style remnants before applying the house paragraph style."""
+        text = Pipeline._plain_text(content)
+        return Pipeline._inline_md_to_html(text)
+
+    @staticmethod
+    def _xzyuan_report_header() -> str:
+        report_label = os.environ.get("FEATURE_REPORT_LABEL", "十字路口报道").strip() or "十字路口报道"
+        editor = os.environ.get("FEATURE_EDITOR_NAME", "AI前线").strip() or "AI前线"
+        return (
+            '<section style="margin:0 8px;line-height:27.2px;">'
+            '<section style="margin-top:0;margin-right:8px;margin-left:8px;'
+            'font-size:17px;letter-spacing:0.544px;text-align:center;line-height:1.75em;">'
+            f'<span style="letter-spacing:1px;"><strong><span style="font-size:18px;color:#fff;'
+            f'line-height:1.4;background-color:rgb(127,127,127);">&nbsp;&nbsp;{Pipeline._inline_md_to_html(report_label)}&nbsp;&nbsp;</span></strong></span>'
+            '</section>'
+            '</section>'
+            '<section style="margin-right:8px;margin-bottom:0px;margin-left:8px;'
+            'min-height:1em;text-align:center;line-height:1.75em;">'
+            f'<span style="font-size:12px;color:rgb(136,136,136);letter-spacing:1px;">编辑：{Pipeline._inline_md_to_html(editor)}</span>'
+            '</section>'
+        )
+
+    @staticmethod
+    def _xzyuan_lead_text(items: list[str], fallback_text: str = "") -> str:
+        parts = []
+        for item in items:
+            text = Pipeline._plain_text(item)
+            text = re.sub(r'^[\-•\s]+', '', text).strip()
+            text = re.sub(r'^\s*#\s*', '', text).strip()
+            text = re.sub(r'^(?:导读|一句话概括|核心看点|适合人群|最值得关注|几个关键数字|读完你会知道)[：:]\s*', '', text)
+            text = re.sub(r'^【[^】]*导读】\s*', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            if text and text not in parts and "相关链接" not in text:
+                parts.append(text)
+
+        if not parts:
+            text = Pipeline._plain_text(fallback_text)
+            text = re.sub(r'【[^】]*导读】\s*', '', text)
+            sentences = re.split(r'(?<=[。！？!?])\s*', text)
+            parts = [s.strip() for s in sentences if len(s.strip()) >= 8][:2]
+
+        lead = " ".join(parts[:2]).strip()
+        if len(lead) > 190:
+            lead = lead[:187].rstrip("，。；;、 ") + "..."
+        return lead
+
+    @staticmethod
+    def _xzyuan_lead_section(lead_text: str) -> str:
+        lead_text = Pipeline._inline_md_to_html(Pipeline._plain_text(lead_text))
+        lead_text = re.sub(r'^\s*#\s*', '', lead_text).strip()
+        if not lead_text:
+            return ""
+        return (
+            '<section style="margin-bottom:0px;color:rgb(34,34,34);letter-spacing:0.544px;">'
+            '<section><section>'
+            '<h5 style="margin-top:10px;margin-right:8px;margin-left:8px;padding:10px;'
+            'font-size:14px;color:rgb(0,0,0);letter-spacing:0.544px;'
+            'font-family:Arial, Helvetica, sans-serif;border-radius:3px;'
+            'background-color:rgb(248,248,248);line-height:1.75em;'
+            'word-break:break-all !important;word-spacing:1px !important;">'
+            '<span style="letter-spacing:1px;font-size:15px;">'
+            '<strong>【十字路口导读】</strong>'
+            f'{lead_text}'
+            '</span></h5>'
+            '</section></section></section>'
+        )
+
+    @staticmethod
+    def _xzyuan_heading_html(content: str) -> str:
+        text = Pipeline._inline_md_to_html(Pipeline._plain_text(content))
+        if not text:
+            return ""
+        return (
+            '<section style="text-align:center;margin:28px 8px 14px 8px;line-height:1.75em;">'
+            '<section style="display:inline-block;border-bottom:2px solid rgb(127,127,127);'
+            'padding:0 8px 4px 8px;">'
+            f'<span style="color:rgb(45,45,45);font-size:18px;letter-spacing:1px;'
+            f'font-family:Georgia, Times New Roman, Times, serif;"><strong>{text}</strong></span>'
+            '</section>'
+            '</section>'
+            '<h2 style="margin-left:8px;margin-right:8px;margin-bottom:0px;line-height:1.75em;">'
+            f'<span style="{Pipeline._xzyuan_text_style()}"><br></span>'
+            '</h2>'
+        )
+
+    @staticmethod
+    def _xzyuan_quote_html(content: str) -> str:
+        content = Pipeline._inline_md_to_html(Pipeline._plain_text(content))
+        if not content:
+            return ""
+        return (
+            '<section style="line-height:1.75;letter-spacing:1px;word-break:break-word;'
+            'color:rgb(91,91,91);border-left:8px solid rgba(158,158,158,0.3);'
+            'border-radius:5px;background:rgba(158,158,158,0.1);'
+            'padding-top:24px;padding-bottom:24px;padding-right:8px;'
+            'margin-top:0px;margin-bottom:24px;">'
+            f'<p style="font-size:15px;margin:0 8px;padding-left:8px;padding-right:8px;line-height:1.75em;letter-spacing:1px;">{content}</p>'
+            '</section>'
+        )
+
+    @staticmethod
+    def _xzyuan_image_html(img_html: str, caption_html: str = "") -> str:
+        img_html = re.sub(r'\sstyle="[^"]*"', '', img_html or "", flags=re.I)
+        img_html = re.sub(r'<img\b', '<img style="width:100%;height:auto;"', img_html, count=1, flags=re.I)
+        if not re.search(r'<img\b', img_html, flags=re.I):
+            return ""
+        caption = ""
+        caption_text = Pipeline._plain_text(caption_html)
+        if caption_text:
+            caption = Pipeline._xzyuan_paragraph_html(
+                Pipeline._inline_md_to_html(caption_text[:120]),
+                margin_bottom=8,
+                text_align="center",
+            )
+        return (
+            '<section style="text-align:center;margin-left:8px;margin-right:8px;margin-bottom:24px;">'
+            f'{img_html}{caption}'
+            '</section>'
+        )
+
+    @staticmethod
+    def _remove_xzyuan_intro_blocks(html: str) -> str:
+        legacy_report = "新" + "智元报道"
+        report_labels = "|".join(re.escape(label) for label in ("十字路口报道", legacy_report, "AI前线报道"))
+        html = re.sub(
+            rf'^\s*<section\b[^>]*>\s*<section\b[^>]*>\s*<span\b[^>]*>.*?(?:{report_labels}).*?</section>\s*</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'^\s*<section\b[^>]*>\s*<span\b[^>]*>\s*编辑：.*?</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'\s*<h5\b[^>]*>\s*.*?【[^】]*导读】.*?</h5>\s*',
+            '\n',
+            html,
+            flags=re.S | re.I,
+        )
+        return html
+
+    @staticmethod
+    def _apply_xzyuan_feature_style(html: str, source_text: str = "", heading_predicate=None) -> str:
+        """Render feature articles in the New-Zhiyuan-like WeChat layout."""
+        if not html:
+            return html
+        heading_predicate = heading_predicate or Pipeline._looks_like_feature_heading
+
+        original_html = html
+        lead_items = Pipeline._extract_lead_items(html) or Pipeline._extract_lead_items(source_text)
+        lead_match = re.search(r'<h5\b[^>]*>(.*?)</h5>', html, flags=re.S | re.I)
+        if lead_match and not lead_items:
+            lead_items = [Pipeline._plain_text(lead_match.group(1))]
+        inline_lead_match = re.search(r'【[^】]*导读】\s*([^<\n]{8,220})', html)
+        if inline_lead_match and not lead_items:
+            lead_items = [inline_lead_match.group(1)]
+
+        body = Pipeline._remove_existing_lead_blocks(html)
+        body = Pipeline._remove_xzyuan_intro_blocks(body)
+        legacy_report = "新" + "智元报道"
+        report_labels = "|".join(re.escape(label) for label in ("十字路口报道", legacy_report, "AI前线报道"))
+        body = re.sub(r'<p\b[^>]*>\s*【[^】]*导读】.*?</p>', '', body, flags=re.S | re.I)
+        body = re.sub(rf'<p\b[^>]*>\s*(?:{report_labels})\s*</p>', '', body, flags=re.S | re.I)
+        body = re.sub(r'<p\b[^>]*>\s*编辑：.*?</p>', '', body, flags=re.S | re.I)
+
+        body = re.sub(
+            r'<section\b[^>]*>\s*<h2\b[^>]*>(.*?)</h2>\s*</section>',
+            lambda m: (
+                Pipeline._xzyuan_heading_html(m.group(1))
+                if heading_predicate(m.group(1))
+                else Pipeline._xzyuan_paragraph_html(Pipeline._clean_xzyuan_inline_content(m.group(1)))
+            ),
+            body,
+            flags=re.S | re.I,
+        )
+        body = re.sub(
+            r'<h[12]\b[^>]*>(.*?)</h[12]>',
+            lambda m: (
+                Pipeline._xzyuan_heading_html(m.group(1))
+                if heading_predicate(m.group(1))
+                else Pipeline._xzyuan_paragraph_html(Pipeline._clean_xzyuan_inline_content(m.group(1)))
+            ),
+            body,
+            flags=re.S | re.I,
+        )
+        body = re.sub(
+            r'<blockquote\b[^>]*>(.*?)</blockquote>',
+            lambda m: Pipeline._xzyuan_quote_html(m.group(1)),
+            body,
+            flags=re.S | re.I,
+        )
+        body = re.sub(r'</?ul\b[^>]*>', '', body, flags=re.I)
+        body = re.sub(
+            r'<li\b[^>]*>(.*?)</li>',
+            lambda m: Pipeline._xzyuan_paragraph_html("• " + Pipeline._inline_md_to_html(Pipeline._plain_text(m.group(1)))),
+            body,
+            flags=re.S | re.I,
+        )
+
+        body = re.sub(
+            r'<section\b[^>]*>\s*(<img\b[^>]*>)\s*(<p\b[^>]*>.*?</p>)?\s*</section>',
+            lambda m: Pipeline._xzyuan_image_html(m.group(1), m.group(2) or ""),
+            body,
+            flags=re.S | re.I,
+        )
+
+        def replace_paragraph(match: re.Match) -> str:
+            inner = (match.group(1) or "").strip()
+            if re.search(r'<img\b', inner, flags=re.I):
+                img_match = re.search(r'<img\b[^>]*>', inner, flags=re.S | re.I)
+                return Pipeline._xzyuan_image_html(img_match.group(0)) if img_match else ""
+            text = Pipeline._plain_text(inner)
+            if not text:
+                return ""
+            if text in {"十字路口报道", legacy_report, "AI前线报道"} or text.startswith("编辑："):
+                return ""
+            if text in {"相关链接", "参考链接"}:
+                return ""
+            if text.startswith(("参考资料", "参考来源", "参考链接", "参考：")):
+                rendered_refs = Pipeline._render_reference_links(
+                    Pipeline._split_reference_candidates(Pipeline._plain_text(inner))
+                )
+                return rendered_refs or Pipeline._xzyuan_paragraph_html("参考资料：", margin_bottom=0)
+            if heading_predicate(text):
+                return Pipeline._xzyuan_heading_html(text)
+            if re.search(r'^(?:一句话概括|核心看点|适合人群|导读)[：:]', text):
+                return ""
+            return Pipeline._xzyuan_paragraph_html(Pipeline._clean_xzyuan_inline_content(inner))
+
+        body = re.sub(r'<p\b[^>]*>(.*?)</p>', replace_paragraph, body, flags=re.S | re.I)
+        wrapped_lines = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("<"):
+                wrapped_lines.append(stripped)
+            else:
+                wrapped_lines.append(Pipeline._xzyuan_paragraph_html(Pipeline._clean_xzyuan_inline_content(stripped)))
+        body = "\n".join(wrapped_lines)
+        body = Pipeline._remove_empty_xzyuan_blocks(body)
+        body = re.sub(r'\n{3,}', '\n\n', body).strip()
+
+        lead_text = Pipeline._xzyuan_lead_text(lead_items, source_text or Pipeline._plain_text(original_html))
+        if not lead_text:
+            lead_text = "这件事正在改变AI行业的下一步走向。"
+
+        html = (
+            Pipeline._xzyuan_report_header()
+            + "\n"
+            + Pipeline._xzyuan_lead_section(lead_text)
+            + "\n"
+            + body
+        )
+        return Pipeline._sanitize_article_html(html).strip()
+
+    @staticmethod
+    def _apply_xzyuan_daily_style(html: str, source_text: str = "") -> str:
+        """Render daily digests with the same house layout used by feature articles."""
+        return Pipeline._apply_xzyuan_feature_style(
+            html,
+            source_text,
+            heading_predicate=Pipeline._looks_like_daily_heading,
+        )
+
+    @staticmethod
     def _plain_text(value: str) -> str:
         value = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
         value = re.sub(r"</(?:p|div|section|h1|h2|li|blockquote)>", "\n", value, flags=re.I)
@@ -3579,6 +4479,20 @@ class Pipeline:
         import html as html_lib
         value = html_lib.unescape(value)
         return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _remove_empty_xzyuan_blocks(html: str) -> str:
+        if not html:
+            return html
+        empty_block = re.compile(
+            r'<(section|p|div)\b[^>]*>\s*(?:<(?:section|p|div)\b[^>]*>\s*</(?:section|p|div)>\s*)*</\1>',
+            flags=re.S | re.I,
+        )
+        previous = None
+        while previous != html:
+            previous = html
+            html = empty_block.sub('', html)
+        return html
 
     @staticmethod
     def _extract_lead_items(text: str) -> list[str]:
@@ -3596,6 +4510,7 @@ class Pipeline:
 
         def add_item(raw: str) -> None:
             raw = re.sub(r'^[\-•\s]+', '', raw).strip()
+            raw = re.sub(r'^\s*#\s*', '', raw).strip()
             raw = re.sub(r'\s+', ' ', raw)
             if raw and "相关链接" not in raw and raw not in {"-", "—"} and raw not in items:
                 items.append(raw)
@@ -3722,24 +4637,52 @@ class Pipeline:
             return ""
 
         links = "\n".join(
-            f'<p style="color:#888;font-size:13px;margin:6px 0;line-height:1.6;">'
-            f'<a href="{url}" style="color:#888;text-decoration:none;word-break:break-all;">{url}</a></p>'
+            '<section style="margin-right:8px;margin-bottom:0px;margin-left:8px;'
+            'min-height:1em;text-align:left;line-height:1.75em;">'
+            f'<span style="font-size:14px;color:rgb(136,136,136);letter-spacing:1px;">'
+            f'<a href="{url}" style="color:rgb(136,136,136);text-decoration:none;word-break:break-all;">{url}</a>'
+            '</span></section>'
             for url in clean_urls[:8]
         )
         return (
-            '<section style="margin:24px 0 8px 0;padding-top:8px;border-top:1px solid #eee;">'
-            '<p style="color:#666;font-size:13px;margin:0 0 6px 0;">相关链接</p>'
-            f'{links}</section>'
+            '<section style="margin-right:8px;margin-bottom:0px;margin-left:8px;'
+            'min-height:1em;text-align:left;line-height:1.75em;">'
+            '<span style="font-size:14px;color:rgb(136,136,136);letter-spacing:1px;">参考资料：</span>'
+            '</section>'
+            f'{links}'
         )
 
     @staticmethod
     def _looks_like_feature_heading(text: str) -> bool:
         text = Pipeline._plain_text(text)
-        if not text or len(text) < 5 or len(text) > 34:
+        if not text or len(text) < 4 or len(text) > 34:
             return False
         if text.startswith(("参考", "来源", "作者", "时间", "链接", "一句话概括", "核心看点", "适合人群")):
             return False
+        if "十字路口报道" in text or "AI前线报道" in text or "新智元报道" in text:
+            return False
+        if text.startswith("编辑：") or " 编辑：" in text:
+            return False
         if re.search(r'[。；;！!]$', text):
+            return False
+        if re.match(r'^[\-•\d.、\s]+$', text):
+            return False
+        if re.search(r'https?://|www\.', text):
+            return False
+        return bool(re.search(r'[一-鿿A-Za-z0-9]', text))
+
+    @staticmethod
+    def _looks_like_daily_heading(text: str) -> bool:
+        text = Pipeline._plain_text(text)
+        if not text or len(text) < 2 or len(text) > 70:
+            return False
+        if text.startswith(("参考", "来源", "作者", "时间", "链接", "一句话概括", "核心看点", "适合人群", "导读")):
+            return False
+        if "十字路口报道" in text or "AI前线报道" in text or "新智元报道" in text:
+            return False
+        if text.startswith("编辑：") or " 编辑：" in text:
+            return False
+        if re.search(r'[。；;！!？?]$', text):
             return False
         if re.match(r'^[\-•\d.、\s]+$', text):
             return False
@@ -3758,8 +4701,8 @@ class Pipeline:
 
             soup = BeautifulSoup(html, "html.parser")
             allowed_tags = {
-                "section", "div", "span", "h1", "h2", "p", "ul", "li", "blockquote",
-                "strong", "em", "code", "a", "img", "br", "mpvideo",
+                "section", "div", "span", "h1", "h2", "h3", "h5", "p", "ul", "li", "blockquote",
+                "strong", "em", "code", "a", "img", "br", "hr", "mpvideo",
             }
             allowed_attrs = {
                 "style", "href", "src", "alt", "title", "data-original-url",
@@ -3851,6 +4794,8 @@ class Pipeline:
             if "font-size:13" in original or "color:#555" in original:
                 return original
             text = Pipeline._plain_text(match.group(1))
+            if len(text) < 6:
+                return original
             if Pipeline._looks_like_feature_heading(text):
                 return Pipeline._heading_html(text)
             return original
@@ -3862,6 +4807,26 @@ class Pipeline:
         if lead_items and re.search(r'<h1\b[^>]*>\s*(?:<strong>)?\s*导读', html, flags=re.I):
             body = Pipeline._remove_existing_lead_blocks(html)
             html = Pipeline._render_lead_section(lead_items) + "\n" + body.lstrip()
+
+        # Remove duplicated report/editor intro blocks that sometimes leak into the body.
+        html = re.sub(
+            r'<section\b[^>]*>\s*<span\b[^>]*>\s*<strong>\s*(?:十字路口报道|AI前线报道|新智元报道)\s*(?:编辑：[^<]+)?\s*</strong>\s*</span>\s*</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'<section\b[^>]*>\s*<span\b[^>]*>\s*<strong>\s*编辑：[^<]+</strong>\s*</span>\s*</section>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
+        html = re.sub(
+            r'<p\b[^>]*>\s*(?:十字路口报道|AI前线报道|新智元报道)\s*(?:编辑：[^<]+)?\s*</p>\s*',
+            '',
+            html,
+            flags=re.S | re.I,
+        )
 
         html = re.sub(
             r'<section>\s*-\s*<strong>一句话概括</strong>：.*?</section>\s*',
@@ -3889,9 +4854,253 @@ class Pipeline:
         else:
             html = self._markdown_to_html(article)
         html = self._clean_final_article_html(html)
-        html = self._ensure_lead_section(html, source_text or self._strip_html(html))
-        html = self._clean_final_article_html(html)
+        html = self._apply_xzyuan_feature_style(html, source_text or self._strip_html(html))
         return html
+
+    @staticmethod
+    def _feature_reference_urls(item: NewsItem, article_html: str = "", source_text: str = "") -> list[str]:
+        """Build a clean reference list for a feature article from source data only."""
+        raw = item.raw_data or {}
+        urls: list[str] = []
+        social_domains = ("x.com", "twitter.com", "reddit.com", "github.com", "huggingface.co")
+
+        def add(url: str) -> None:
+            if not url:
+                return
+            url = url.strip()
+            if not url.startswith(("http://", "https://")):
+                return
+            if url not in urls:
+                urls.append(url)
+
+        add(item.url)
+        add(raw.get("official_url", ""))
+
+        for ref_url in raw.get("links", []) or []:
+            ref_lower = ref_url.lower().strip()
+            if any(domain in ref_lower for domain in social_domains):
+                add(ref_url)
+                continue
+            if ref_url in article_html or ref_url in source_text:
+                add(ref_url)
+
+        # Keep social links that were actually mentioned in the draft body.
+        if article_html:
+            for url in re.findall(r'https?://(?:x\.com|twitter\.com|reddit\.com|github\.com|huggingface\.co)/[^\s<>"\']+', article_html, flags=re.I):
+                add(url)
+
+        excluded_domains = {
+            "baidu.com", "baike.baidu.com", "baike.sogou.com", "sogou.com",
+            "3elife.net", "ithome.com", "douyin.com", "tiktok.com", "weibo.com",
+            "xiaohongshu.com", "bilibili.com", "youtube.com", "youtu.be",
+            "taobao.com", "tmall.com", "jd.com",
+        }
+
+        clean_urls: list[str] = []
+        for url in urls:
+            domain = urlparse(url).netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if any(domain == d or domain.endswith("." + d) for d in excluded_domains):
+                continue
+            if url not in clean_urls:
+                clean_urls.append(url)
+        return clean_urls
+
+    @staticmethod
+    def _strip_reference_section(html: str) -> str:
+        if not html:
+            return html
+        labels = r'(?:参考资料|参考来源|参考链接|相关链接|资料来源|信息来源|References?|Sources?|Source)'
+        patterns = (
+            rf'<p\b[^>]*>(?:(?!</p>).)*?{labels}\s*[：:]?(?:(?!</p>).)*?</p>',
+            rf'<li\b[^>]*>(?:(?!</li>).)*?{labels}\s*[：:]?(?:(?!</li>).)*?</li>',
+            rf'<h[1-6]\b[^>]*>(?:(?!</h[1-6]>).)*?{labels}\s*[：:]?(?:(?!</h[1-6]>).)*?</h[1-6]>',
+            rf'<section\b[^>]*>(?:(?!</section>|<p\b).)*?{labels}\s*[：:]?(?:(?!</section>|<p\b).)*?</section>',
+            rf'(?m)^\s*(?:[#>*\-\s•]*\s*)?{labels}\s*[：:]?.*$',
+        )
+        starts = []
+        for pattern in patterns:
+            starts.extend(match.start() for match in re.finditer(pattern, html, flags=re.S | re.I))
+        if starts:
+            html = html[:min(starts)]
+        return Pipeline._remove_empty_xzyuan_blocks(html).strip()
+
+    @staticmethod
+    def _feature_x_search_queries(item: NewsItem, article_html: str = "") -> list[str]:
+        queries: list[str] = []
+        seeds = [
+            item.title or "",
+            item.content[:180] if item.content else "",
+            Pipeline._plain_text(article_html)[:180] if article_html else "",
+        ]
+        for seed in seeds:
+            seed = re.sub(r'\s+', ' ', seed).strip()
+            if not seed:
+                continue
+            seed = re.sub(r'(?i)\b(参考资料|相关链接|来源|author|published|http://|https://)\b.*$', '', seed).strip()
+            if seed and seed not in queries:
+                queries.append(seed[:160])
+        return queries[:3]
+
+    def _enrich_feature_x_links(self, item: NewsItem, article_html: str = "") -> list[str]:
+        """Use OpenCLI X search to fetch related tweets when the draft lacks X links."""
+        raw = item.raw_data or {}
+        existing = []
+        for url in raw.get("links", []) or []:
+            if url and url.startswith(("http://", "https://")) and url not in existing:
+                existing.append(url)
+
+        if any("x.com" in url.lower() or "twitter.com" in url.lower() for url in existing):
+            return []
+
+        queries = self._feature_x_search_queries(item, article_html)
+        if not queries:
+            return []
+
+        try:
+            from src.utils.opencli_search import twitter_search as opencli_twitter_search
+        except Exception as e:
+            logger.debug(f"OpenCLI Twitter search unavailable: {e}")
+            return []
+
+        found_urls: list[str] = []
+        for query in queries:
+            try:
+                results = opencli_twitter_search(query, limit=5)
+            except Exception as e:
+                logger.debug(f"OpenCLI Twitter search failed for '{query[:60]}': {e}")
+                continue
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                url = (result.get("url") or "").strip()
+                if not url or ("x.com" not in url.lower() and "twitter.com" not in url.lower()):
+                    continue
+                if url not in found_urls:
+                    found_urls.append(url)
+                if len(found_urls) >= 3:
+                    break
+            if len(found_urls) >= 3:
+                break
+
+        if not found_urls:
+            for query in queries:
+                try:
+                    search_url = f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
+                    html = fetch_html_via_opencli(search_url, timeout=180, max_chars=0)
+                except Exception as e:
+                    logger.debug(f"OpenCLI browser X search failed for '{query[:60]}': {e}")
+                    continue
+                if not html:
+                    continue
+                for url in re.findall(r'https?://(?:x\.com|twitter\.com)/[^\s<>"\']+/status/\d+(?:[^\s<>"\']*)?', html, flags=re.I):
+                    if url not in found_urls:
+                        found_urls.append(url)
+                    if len(found_urls) >= 3:
+                        break
+                if len(found_urls) >= 3:
+                    break
+
+        if not found_urls:
+            return []
+
+        updated_links = existing[:]
+        for url in found_urls:
+            if url not in updated_links:
+                updated_links.append(url)
+        raw["links"] = updated_links
+        item.raw_data = raw
+        return found_urls
+
+    def _capture_feature_screenshot(self, item: NewsItem, article_html: str = "", cache_namespace: str = "") -> str | None:
+        """Capture a screenshot for the source page or a social reference."""
+        raw = item.raw_data or {}
+        candidates: list[str] = []
+
+        def add(url: str) -> None:
+            if url and url.startswith("http") and url not in candidates:
+                candidates.append(url)
+
+        add(raw.get("official_url", ""))
+        add(item.url)
+        for ref_url in raw.get("links", []) or []:
+            add(ref_url)
+
+        social_priority = ("x.com", "twitter.com", "reddit.com", "github.com", "huggingface.co")
+        target_url = ""
+        for domain in social_priority:
+            for url in candidates:
+                if domain in url.lower():
+                    target_url = url
+                    break
+            if target_url:
+                break
+        if not target_url:
+            target_url = candidates[0] if candidates else ""
+        if not target_url:
+            return None
+
+        try:
+            if "reddit.com" in target_url.lower():
+                from src.utils.reddit_screenshot import RedditScreenshot
+                shot = RedditScreenshot().capture(target_url)
+            elif "x.com" in target_url.lower() or "twitter.com" in target_url.lower():
+                from src.utils.twitter_screenshot import TwitterScreenshot
+                shot = TwitterScreenshot().capture(target_url)
+            elif "github.com" in target_url.lower():
+                from src.utils.github_screenshot import GitHubScreenshot
+                shot = GitHubScreenshot().capture(target_url)
+            elif "huggingface.co" in target_url.lower():
+                from src.utils.huggingface_screenshot import HuggingFaceScreenshot
+                shot = HuggingFaceScreenshot().capture(target_url)
+            else:
+                from src.utils.webpage_screenshot import WebpageScreenshot
+                shot = WebpageScreenshot().capture(target_url)
+
+            if shot and Path(shot).exists():
+                return str(shot)
+        except Exception as e:
+            logger.debug(f"Feature screenshot capture failed for {target_url}: {e}")
+        return None
+
+    def _insert_feature_screenshot(self, article_html: str, item: NewsItem, cache_namespace: str = "") -> str:
+        """Insert a source screenshot into a feature article when it has no body images."""
+        if not article_html or re.search(r'<img\b', article_html, flags=re.I):
+            return article_html
+
+        screenshot_path = self._capture_feature_screenshot(item, article_html, cache_namespace=cache_namespace)
+        if not screenshot_path:
+            return article_html
+
+        img_html = self._download_and_upload_image(screenshot_path, item.title, cache_namespace=cache_namespace)
+        if not img_html:
+            return article_html
+
+        first_p = article_html.find('<p')
+        if first_p != -1:
+            return article_html[:first_p] + "\n" + img_html + "\n" + article_html[first_p:]
+
+        first_h2 = article_html.find('<section style="text-align:center;margin:28px 8px 14px 8px;line-height:1.75em;">')
+        if first_h2 != -1:
+            return article_html[:first_h2] + "\n" + img_html + "\n" + article_html[first_h2:]
+
+        return article_html + "\n" + img_html
+
+    def _feature_postprocess_article_html(self, article_html: str, item: NewsItem, cache_namespace: str = "") -> str:
+        """Apply feature-specific cleanup, screenshot insertion, and references."""
+        if not article_html:
+            return article_html
+
+        self._enrich_feature_x_links(item, article_html)
+        article_html = self._strip_reference_section(article_html)
+        article_html = self._insert_feature_screenshot(article_html, item, cache_namespace=cache_namespace)
+
+        ref_urls = self._feature_reference_urls(item, article_html, source_text=item.content or "")
+        if ref_urls:
+            article_html = article_html.rstrip() + "\n" + self._render_reference_links(ref_urls)
+
+        return self._sanitize_article_html(article_html)
 
     def _insert_image_block_near_best_position(
         self,
@@ -3900,16 +5109,10 @@ class Pipeline:
         caption: str = "",
         **_: object,
     ) -> str:
-        image_block = (
-            '<section style="text-align:center;margin:12px 0;">'
-            f'<img src="{image_url}" style="max-width:100%;border-radius:8px;" />'
+        image_block = self._xzyuan_image_html(
+            f'<img src="{image_url}" />',
+            self._inline_md_to_html(caption[:120]) if caption else "",
         )
-        if caption:
-            image_block += (
-                f'<p style="color:#555;font-size:13px;margin:6px 0 0 0;line-height:1.6;">'
-                f'{self._inline_md_to_html(caption[:120])}</p>'
-            )
-        image_block += '</section>'
 
         lead_end = article_html.find('</section>')
         if lead_end != -1 and "导读" in article_html[:lead_end]:

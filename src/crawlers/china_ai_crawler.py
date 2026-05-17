@@ -2,7 +2,7 @@
 """爬取国内 AI 科技媒体文章。
 
 通过 RSS/WordPress API/jina.ai 代理获取国内 AI 新闻。
-支持：量子位、新智元、机器之心、智东西、雷锋网
+支持：量子位、十字路口、机器之心、智东西、雷锋网
 """
 
 from datetime import datetime, timezone, timedelta
@@ -26,7 +26,7 @@ SOURCES = {
         "base_url": "https://www.qbitai.com",
     },
     "aiera": {
-        "name": "新智元",
+        "name": "十字路口",
         "type": "wordpress_api",
         "api_url": "https://aiera.com.cn/wp-json/wp/v2/posts",
         "base_url": "https://aiera.com.cn",
@@ -70,7 +70,7 @@ COMPANY_KEYWORDS = [
 class ChinaAICrawler(BaseCrawler):
     """爬取国内 AI 科技媒体的文章。"""
 
-    def fetch(self) -> list[NewsItem]:
+    def _fetch(self) -> list[NewsItem]:
         enabled_sources = self.config.get(
             "sources", list(SOURCES.keys())
         )

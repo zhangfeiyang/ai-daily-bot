@@ -33,6 +33,16 @@ python main.py weekly
 python main.py daily --debug
 python main.py feature --debug
 
+# 只生成 HTML，人工复审后再手动上传草稿
+python main.py daily-live --stage-only
+python main.py draft output/articles/daily_2026-05-13.html
+
+# 如需启用通用网页搜索补充源（默认关闭，避免无时间戳结果绕过新鲜度过滤）
+ENABLE_DAILY_WEB_SEARCH=1 python main.py daily
+
+# 精选深度默认最多生成 5 篇，可按需调整
+FEATURE_MAX_ARTICLES=3 python main.py feature
+
 # 仅爬取测试
 python main.py test
 
@@ -65,6 +75,32 @@ export WECHAT_APP_SECRET=xxx
 ```
 
 或写入 `.env` 文件（已加入 .gitignore）。
+
+## 图片生成
+
+系统支持多种图片生成供应商，可通过环境变量 `IMAGE_PROVIDER` 进行切换：
+
+| 供应商 | `IMAGE_PROVIDER` 值 | 说明 |
+|------|-------------------|------|
+| **Doubao (豆包)** | `doubao` (默认) | **推荐**。通过网页版豆包自动生成，画质高且免费。需运行本地 API 服务。 |
+| **MiniMax** | `minimax` | 兜底方案。需配置 `MINIMAX_API_KEY`。 |
+
+### 使用豆包生图
+
+豆包生图通过浏览器自动化实现，集成自 `/home/zhangfy/doubao/doubao-api`。
+
+1. **启动 API 服务**：
+   ```bash
+   cd /home/zhangfy/doubao/doubao-api
+   bash run.sh
+   ```
+2. **首次使用需登录**：
+   访问 `http://localhost:8000/login` 或运行 `bash setup_login.sh` 并在打开的浏览器中完成登录。
+3. **配置主系统**：
+   在主系统的 `.env` 中设置（可选，默认为 8000 端口）：
+   ```bash
+   DOUBAO_API_URL=http://127.0.0.1:8000/image
+   ```
 
 ## 视频生成
 
@@ -106,9 +142,9 @@ bash setup_cron.sh
 
 每天 7:30 自动执行 daily 模式，每周日 10:00 执行 weekly 模式。
 
-当前 `feature` 也会在生成完成后自动把当天的 `feature_YYYY-MM-DD_*.html` 上传到公众号草稿箱，适合直接人工复审后再发。
+当前 `daily` / `daily-live` / `feature` 默认会在生成完成后把当天 HTML 上传到公众号草稿箱；使用 `--debug` 或 `--stage-only` 时只落盘到 `output/articles/`，适合先人工复审，再手动执行 `python main.py draft <article.html>`。
 
-如果你希望只先生成不进草稿箱，继续用 `--debug`，或者手动执行 `python main.py draft <article.html>`。
+人工复审时请优先检查事实新鲜度、图片是否来自官方或高价值素材、参考链接是否保留完整。
 
 ## 项目结构
 

@@ -1,5 +1,6 @@
 # src/publish/wechat.py
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ class WeChatPublisher:
     def __init__(self, config: dict):
         self.app_id = config.get("app_id", "")
         self.app_secret = config.get("app_secret", "")
+        self.timeout = float(config.get("timeout_seconds") or os.environ.get("WECHAT_REQUEST_TIMEOUT_SECONDS", "30"))
         self._token = None
         self._token_expires = 0
         self._default_thumb_media_id = None
@@ -21,6 +23,11 @@ class WeChatPublisher:
     def _get_access_token(self) -> str:
         if self._token and time.time() < self._token_expires:
             return self._token
+        return self._refresh_access_token()
+
+    def _refresh_access_token(self) -> str:
+        self._token = None
+        self._token_expires = 0
 
         url = f"{self.BASE_URL}/token"
         params = {
@@ -28,7 +35,7 @@ class WeChatPublisher:
             "appid": self.app_id,
             "secret": self.app_secret,
         }
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -40,6 +47,33 @@ class WeChatPublisher:
         logger.info("WeChat access_token refreshed")
         return self._token
 
+    @staticmethod
+    def _is_invalid_token_response(data: dict) -> bool:
+        return data.get("errcode") in {40001, 40014, 42001}
+
+    def _post_with_token_retry(self, url: str, *, params: dict, **kwargs):
+        """POST once, refresh token on invalid-token responses, then retry once."""
+        kwargs.setdefault("timeout", self.timeout)
+        resp = requests.post(url, params=params, **kwargs)
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError:
+            return resp, {}
+
+        if self._is_invalid_token_response(data):
+            logger.warning("WeChat access_token invalid during request; refreshing and retrying once")
+            token = self._refresh_access_token()
+            retry_params = dict(params)
+            retry_params["access_token"] = token
+            resp = requests.post(url, params=retry_params, **kwargs)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+        return resp, data
+
     def upload_audio(self, audio_path: str) -> str:
         token = self._get_access_token()
         url = f"{self.BASE_URL}/material/add_material"
@@ -47,7 +81,7 @@ class WeChatPublisher:
 
         with open(audio_path, "rb") as f:
             files = {"media": (Path(audio_path).name, f, "audio/mpeg")}
-            resp = requests.post(url, params=params, files=files)
+            resp = requests.post(url, params=params, files=files, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -64,7 +98,7 @@ class WeChatPublisher:
 
         with open(image_path, "rb") as f:
             files = {"media": (Path(image_path).name, f, "image/jpeg")}
-            resp = requests.post(url, params=params, files=files)
+            resp = requests.post(url, params=params, files=files, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -93,7 +127,7 @@ class WeChatPublisher:
         # Try to publish directly; if unauthorized (subscription account), stop at draft
         pub_url = f"{self.BASE_URL}/freepublish/submit"
         pub_data = {"media_id": draft_id}
-        resp = requests.post(pub_url, params={"access_token": token}, json=pub_data)
+        resp = requests.post(pub_url, params={"access_token": token}, json=pub_data, timeout=self.timeout)
         resp.raise_for_status()
         pub = resp.json()
 
@@ -148,14 +182,12 @@ class WeChatPublisher:
                 }
             ],
         }
-        resp = requests.post(
+        resp, draft = self._post_with_token_retry(
             draft_url,
             params={"access_token": token},
             data=json.dumps(draft_data, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=utf-8"},
         )
-        resp.raise_for_status()
-        draft = resp.json()
 
         if "media_id" not in draft:
             raise RuntimeError(f"WeChat create draft failed: {draft}")
@@ -276,9 +308,7 @@ class WeChatPublisher:
         url = f"{self.BASE_URL}/material/add_material"
         params = {"access_token": token, "type": "image"}
         files = {"media": ("cover.png", png, "image/png")}
-        resp = requests.post(url, params=params, files=files)
-        resp.raise_for_status()
-        data = resp.json()
+        resp, data = self._post_with_token_retry(url, params=params, files=files)
 
         if "media_id" not in data:
             raise RuntimeError(f"WeChat upload default thumb failed: {data}")
@@ -298,9 +328,17 @@ class WeChatPublisher:
 
         with open(image_path, "rb") as f:
             files = {"media": (Path(image_path).name, f, "image/png")}
-            resp = requests.post(url, params=params, files=files)
+            resp = requests.post(url, params=params, files=files, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
+        if self._is_invalid_token_response(data):
+            logger.warning("WeChat access_token invalid during image upload; refreshing and retrying once")
+            token = self._refresh_access_token()
+            with open(image_path, "rb") as f:
+                files = {"media": (Path(image_path).name, f, "image/png")}
+                resp = requests.post(url, params={"access_token": token}, files=files, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
 
         if "url" not in data:
             logger.warning(f"WeChat upload image failed: {data}")
@@ -345,7 +383,7 @@ class WeChatPublisher:
                 files = {"media": (video_path.name, f, "video/mp4")}
                 description = json.dumps({"title": title[:20], "introduction": title[:120]}, ensure_ascii=False)
                 data = {"description": description}
-                resp = requests.post(url, params=params, files=files, data=data, timeout=60)
+                resp = requests.post(url, params=params, files=files, data=data, timeout=max(self.timeout, 60))
             resp.raise_for_status()
             result = resp.json()
 

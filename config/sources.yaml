@@ -7,26 +7,38 @@ arxiv:
     - cs.LG
   max_results: 30
   sort_by: submittedDate
-  max_age_hours: 24
+  max_age_hours: 72
 
 reddit:
   enabled: true
+  # OpenCLI Reddit 搜索驱动：这些词会直接作为搜索词使用
+  search_queries:
+    - OpenAI Codex
+    - Claude Code
+    - Gemini CLI
+    - DeepSeek
+    - MCP
+    - Cursor
+    - AI agent
+    - local LLM
+  # 兼容字段：当 search_queries 为空时才会回退使用
   subreddits:
     - MachineLearning
     - artificial
     - ChatGPT
     - LocalLLaMA
-  sort: hot
   limit: 25
+  # OpenCLI reddit search 不返回精确发布时间，必须限制搜索窗口，避免旧帖被当成新帖。
   time_filter: day
-  max_age_hours: 24
+  sort: top
+  max_age_hours: 72
   # Minimum upvotes for a post to be included
   # Posts below this threshold are filtered out
   min_score: 20
 
 twitter:
   enabled: true
-  max_age_hours: 24
+  max_age_hours: 72
   accounts:
     # AI 公司官方
     - OpenAI
@@ -80,16 +92,16 @@ twitter:
     - https://nitter.privacydev.net
 
 huggingface:
-  enabled: true
+  enabled: false
   url: https://huggingface.co/papers
   max_results: 25
-  max_age_hours: 24
+  max_age_hours: 72
 
 modelscope:
-  enabled: true
+  enabled: false
   url: https://modelscope.cn/models
   max_results: 20
-  max_age_hours: 24
+  max_age_hours: 72
 
 github:
   enabled: true
@@ -108,13 +120,55 @@ github:
   topic_limit: 5
   min_stars: 50
   max_results: 25
-  max_age_hours: 24
+  max_age_hours: 72
 
 china_ai:
   enabled: false
   sources: []
   max_results: 15
-  max_age_hours: 24
+  max_age_hours: 72
   per_page: 30
   max_articles_per_source: 20
   filter_companies: true
+
+aihot:
+  enabled: true
+  feeds:
+    - https://aihot.virxact.com/feed.xml
+    - https://aihot.virxact.com/feed/all.xml
+  max_results: 30
+  max_age_hours: 48
+
+changelog:
+  enabled: true
+  sources:
+    # 官网 changelog（需要 Playwright，不稳定，暂时禁用）
+    - name: claude-code
+      tool_name: Claude Code
+      url: https://code.claude.com/docs/en/changelog
+      type: claude_docs
+      enabled: false
+      javascript: true
+      wait_selector: "main"
+    - name: cursor
+      tool_name: Cursor
+      url: https://www.cursor.com/changelog
+      type: cursor_blog
+      enabled: false
+      javascript: true
+      wait_selector: "main"
+    - name: codex-github
+      tool_name: OpenAI Codex
+      url: https://github.com/openai/codex/releases
+      type: github_releases
+      repo: openai/codex
+      enabled: true
+    - name: claude-code-github
+      tool_name: Claude Code
+      url: https://github.com/anthropics/claude-code/releases
+      type: github_releases
+      repo: anthropics/claude-code
+      enabled: true
+  max_results: 20
+  max_age_hours: 72
+  timeout: 30

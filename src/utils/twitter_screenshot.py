@@ -7,6 +7,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from src.utils.opencli_browser import capture_screenshot_via_opencli
+
 
 class TwitterScreenshot:
     """Capture screenshots of Twitter/X posts."""
@@ -69,7 +71,7 @@ class TwitterScreenshot:
 
                 if not browser:
                     logger.error("No browser could be launched")
-                    return None
+                    raise RuntimeError("No browser could be launched")
 
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
@@ -117,6 +119,7 @@ class TwitterScreenshot:
                                     return cache_path
                             except:
                                 continue
+                        raise RuntimeError(f"Tweet content not found on nitter: {tweet_url}")
                 except Exception as e:
                     logger.debug(f"Nitter fallback failed: {e}")
 
@@ -158,10 +161,13 @@ class TwitterScreenshot:
                 except Exception as e:
                     logger.warning(f"Direct x.com capture failed: {e}")
                     browser.close()
-                    return None
+                    raise
 
         except Exception as e:
             logger.warning(f"Failed to capture tweet screenshot: {e}")
+            fallback = capture_screenshot_via_opencli(tweet_url, cache_path, full_page=False)
+            if fallback:
+                return fallback
             return None
 
     def capture_from_text(self, text: str) -> Path | None:

@@ -39,15 +39,34 @@ class SmokeLLM:
         self.generate_calls: list[dict] = []
         self.image_calls: list[dict] = []
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         self.generate_calls.append(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
             }
         )
         if "去AI味" in system_prompt or "资深中文编辑" in system_prompt:
             return user_prompt
+        title_match = re.search(r"^标题：(.+)$", user_prompt, flags=re.M)
+        if title_match:
+            title = title_match.group(1).strip()
+            url_match = re.search(r"^链接：(.+)$", user_prompt, flags=re.M)
+            refs_match = re.search(r"^参考链接：(.+)$", user_prompt, flags=re.M)
+            refs = refs_match.group(1).strip() if refs_match else (url_match.group(1).strip() if url_match else "")
+            return (
+                f"## {title}\n\n"
+                "先说结论：这类更新的价值，通常不在参数表，而在工作流里少走几步。\n\n"
+                f"参考链接：{refs}"
+            )
         return self.article_markdown
 
     def generate_with_images(self, system_prompt: str, text: str, image_urls: list[str], provider: str = "vision") -> str:
@@ -200,7 +219,9 @@ def run_smoke_pipeline(workdir: str | Path) -> SmokeResult:
     workdir.mkdir(parents=True, exist_ok=True)
 
     old_cwd = Path.cwd()
+    old_daily_web_search = os.environ.get("ENABLE_DAILY_WEB_SEARCH")
     os.chdir(workdir)
+    os.environ["ENABLE_DAILY_WEB_SEARCH"] = "0"
     try:
         crawler = SmokeCrawler()
         items = crawler.fetch()
@@ -219,6 +240,8 @@ def run_smoke_pipeline(workdir: str | Path) -> SmokeResult:
         )
 
         def fake_fetch_page_assets(self, url: str):
+            if "deepseek" in url:
+                return [], [], ["https://cdn.example.com/deepseek-demo.mp4"]
             return [], [], []
 
         def fake_generate_cover(self, today: str, items: list[NewsItem], article_text: str) -> str:
@@ -251,6 +274,8 @@ def run_smoke_pipeline(workdir: str | Path) -> SmokeResult:
         pipeline._download_and_upload_image = MethodType(fake_download_and_upload_image, pipeline)
         pipeline._download_and_render_video = MethodType(fake_download_and_render_video, pipeline)
         pipeline._generate_section_image = MethodType(fake_generate_section_image, pipeline)
+        pipeline._compute_image_feature_vector = MethodType(lambda self, image_url: None, pipeline)
+        pipeline._compute_image_phash = lambda image_url: None
 
         success = pipeline.run()
 
@@ -275,6 +300,10 @@ def run_smoke_pipeline(workdir: str | Path) -> SmokeResult:
             audio_paths=publisher.publish_calls[0]["audio_paths"] if publisher.publish_calls else [],
         )
     finally:
+        if old_daily_web_search is None:
+            os.environ.pop("ENABLE_DAILY_WEB_SEARCH", None)
+        else:
+            os.environ["ENABLE_DAILY_WEB_SEARCH"] = old_daily_web_search
         os.chdir(old_cwd)
 
 

@@ -1,39 +1,13 @@
-default: gemini
-fallbacks:
-  gemini: [chatgpt, deepseek, doubao]
-  chatgpt: [gemini, deepseek, doubao]
-  deepseek: [gemini, chatgpt, doubao]
-  doubao: [gemini, chatgpt, deepseek]
+default: minimax
 providers:
-  gemini:
-    protocol: opencli
-    site: gemini
-    timeout: 180
-    new: true
-  chatgpt:
-    protocol: opencli
-    site: chatgpt
-    timeout: 180
-    new: true
-  deepseek:
-    protocol: opencli
-    site: deepseek
-    model: expert
-    timeout: 180
-    new: true
-  doubao:
-    protocol: opencli
-    site: doubao
-    timeout: 180
+  minimax:
+    protocol: openai
+    timeout: 300
+    model: MiniMax-M2.7
+    api_key: sk-cp-5KmjLMmIkslPFEAf11KBOswi0ZNnisYkHwhlnZne8ztO0Z-JY7PHFfwFxEWS2cuzQyeRdKCKcevOCDV_AQc3IGR6wo6DfMev4WErvHTHhTt6hw5e9LCUmFc
+    base_url: https://api.minimaxi.com/v1
   vision:
-    protocol: opencli
-    site: deepseek
-    model: vision
-    timeout: 180
-    new: true
-  image:
-    enabled: true
-    protocol: opencli
-    site: gemini
-    fallbacks: [chatgpt]
-    timeout: 360
+    protocol: minimax_mcp
+    timeout: 120
+    api_key: sk-cp-5KmjLMmIkslPFEAf11KBOswi0ZNnisYkHwhlnZne8ztO0Z-JY7PHFfwFxEWS2cuzQyeRdKCKcevOCDV_AQc3IGR6wo6DfMev4WErvHTHhTt6hw5e9LCUmFc
+    api_host: https://api.minimaxi.com

@@ -2,7 +2,10 @@
 
 筛选标准（按优先级）：
 1. **重磅发布**：新模型、新产品、新功能发布（如 OpenAI、Google、DeepSeek、智谱、Kimi、小米等官方发布）
-2. **AI 工具与 Agent**：Claude Code、Codex、Cursor、Devin、Manus、OpenClaw 等 AI 编程/Agent 工具的重大更新；爆火的 Agent 项目；MCP 协议更新
+2. **AI 工具与 Agent 更新（最高优先级）**：
+   - Claude Code、Codex、OpenClaw、Hermes Agent、Cursor、Devin、Manus 等 AI 编程/Agent 工具的版本更新、功能发布
+   - 这些工具的更新优先级等同于重磅发布，只要有更新就必须选入
+   - MCP 协议更新、AI IDE 功能升级也属于此类
 3. **技术突破**：新架构、新训练方法、新 benchmark 纪录、性能大幅提升
 4. **AI 对行业冲击**：AI 替代岗位、行业变革、职业转型、企业裁员/招聘变化
 5. **AI 与未来社会**：AI 对工作方式、生活方式、教育、医疗的深远影响
@@ -23,7 +26,7 @@
 - 优先选择时效性强的新闻（24小时内）
 - 不要选纯学术论文，除非是重大突破
 - GitHub 项目星数低于 100 的直接排除，不值得报道
-- AI 工具/Agent 项目的重大更新优先级等同于重磅发布
+- **AI 工具/Agent 更新（Claude Code、Codex、OpenClaw、Hermes、Cursor 等）只要有更新就必须选入，优先级等同于重磅发布，不可跳过**
 
 只返回 10 条新闻的编号，每行一个数字，不要其他内容：
 1

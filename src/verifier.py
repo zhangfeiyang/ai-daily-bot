@@ -11,13 +11,14 @@
 """
 
 import re
-import json
-import subprocess
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, unquote, parse_qs
 from loguru import logger
 from src.minimax_mcp import MiniMaxMCPClient
-from src.utils.opencli_search import twitter_search as opencli_twitter_search
+from src.utils.opencli_search import (
+    twitter_search as opencli_twitter_search,
+    web_search as opencli_web_search,
+)
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -716,27 +717,9 @@ class NewsVerifier:
 
     @staticmethod
     def _opencli_web_search(query: str, max_results: int = 3) -> list[dict]:
-        """Use OpenCLI Google search as the first-priority web search source."""
+        """Use OpenCLI web search with Google first and browser-challenge fallbacks."""
         try:
-            proc = subprocess.run(
-                ["opencli", "google", "search", query, "--limit", str(max_results), "-f", "json"],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
-            )
-            if proc.returncode != 0:
-                logger.debug(f"OpenCLI search failed ({proc.returncode}): {(proc.stderr or proc.stdout or '').strip()}")
-                return []
-
-            output = (proc.stdout or "").strip()
-            if not output:
-                return []
-
-            data = json.loads(output)
-            if not isinstance(data, list):
-                data = [data]
-
+            data = opencli_web_search(query, limit=max_results, timeout=90)
             results = []
             for item in data:
                 if not isinstance(item, dict):

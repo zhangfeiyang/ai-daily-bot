@@ -26,14 +26,44 @@ class RedditCrawler(BaseCrawler):
         "paper", "github", "release", "open source",
     ]
 
+    SEARCH_STOPWORDS = {
+        "a", "an", "and", "are", "as", "at", "by", "for", "from", "he", "in",
+        "is", "it", "joins", "of", "on", "or", "she", "the", "to", "will",
+        "with", "ai",
+    }
+
     def _fetch(self) -> list[NewsItem]:
         subreddits = self.config.get("subreddits", ["MachineLearning"])
         limit = self.config.get("limit", 15)
         min_score = self.config.get("min_score", 20)
+        time_filter = self.config.get("time_filter", "day")
+        sort = self.config.get("sort", "top")
+        require_query_match = bool(self.config.get("search_queries", []))
         search_queries = self._build_search_queries(subreddits)
 
-        items = self._fetch_search_results(search_queries, limit, min_score=min_score)
+        items = self._fetch_search_results(
+            search_queries,
+            limit,
+            min_score=min_score,
+            time_filter=time_filter,
+            sort=sort,
+            require_query_match=require_query_match,
+        )
         return self.filter_recent(items)
+
+    def get_cache_key(self) -> str:
+        queries = self.config.get("search_queries") or self.config.get("subreddits") or []
+        if isinstance(queries, str):
+            queries = [queries]
+        parts = [
+            "reddit-search-v2",
+            f"time={self.config.get('time_filter', 'day')}",
+            f"sort={self.config.get('sort', 'top')}",
+            f"limit={self.config.get('limit', 15)}",
+            f"min_score={self.config.get('min_score', 20)}",
+            *[str(query).strip() for query in queries if str(query).strip()],
+        ]
+        return "|".join(parts)
 
     def _build_search_queries(self, subreddits: list[str]) -> list[str]:
         """Build OpenCLI search queries from explicit search queries or subreddits."""
@@ -47,6 +77,9 @@ class RedditCrawler(BaseCrawler):
         search_queries: list[str],
         limit: int,
         min_score: int = 20,
+        time_filter: str | None = "day",
+        sort: str | None = "top",
+        require_query_match: bool = False,
     ) -> list[NewsItem]:
         """Use OpenCLI Reddit search when explicit search queries are configured."""
         items: list[NewsItem] = []
@@ -54,7 +87,12 @@ class RedditCrawler(BaseCrawler):
 
         for query in search_queries:
             try:
-                results = opencli_reddit_search(str(query), limit=limit)
+                results = opencli_reddit_search(
+                    str(query),
+                    limit=limit,
+                    time_filter=time_filter,
+                    sort=sort,
+                )
             except Exception as e:
                 logger.debug(f"Reddit: OpenCLI search failed for query {query!r}: {e}")
                 continue
@@ -83,6 +121,8 @@ class RedditCrawler(BaseCrawler):
                 author = result.get("author", "")
                 comments = result.get("comments")
                 content = result.get("snippet", "") or title
+                if require_query_match and not self._matches_search_query(query, title, content):
+                    continue
 
                 items.append(
                     NewsItem(
@@ -98,6 +138,9 @@ class RedditCrawler(BaseCrawler):
                             "reddit_score": score,
                             "reddit_comments": comments,
                             "search_query": query,
+                            "search_time_filter": time_filter,
+                            "search_sort": sort,
+                            "published_at_source": "opencli_reddit_search_window",
                         },
                     )
                 )
@@ -106,6 +149,19 @@ class RedditCrawler(BaseCrawler):
                     return items
 
         return items
+
+    @classmethod
+    def _matches_search_query(cls, query: str, title: str, content: str = "") -> bool:
+        """Reject OpenCLI Reddit fallback results that do not match the requested topic."""
+        tokens = [
+            token
+            for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", query.lower())
+            if len(token) >= 3 and token not in cls.SEARCH_STOPWORDS
+        ]
+        if not tokens:
+            return True
+        haystack = f"{title} {content}".lower()
+        return any(token in haystack for token in tokens)
 
     def _is_low_quality_title(self, title: str) -> bool:
         title_lower = title.lower()

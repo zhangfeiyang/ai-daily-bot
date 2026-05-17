@@ -3,3 +3,8 @@ edge-tts:
   voice: zh-CN-YunxiNeural
   rate: "+0%"
   output_format: mp3
+gpt-sovits:
+  url: http://127.0.0.1:9880/tts
+  ref_audio_path: /home/zhangfy/local-tts/GPT-SoVITS/reference.wav
+  prompt_text: 欢迎使用GPT-SoVITS
+  prompt_lang: zh

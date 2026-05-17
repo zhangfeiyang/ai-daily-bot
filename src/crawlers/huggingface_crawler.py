@@ -6,22 +6,21 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from src.crawlers.base import BaseCrawler
+from src.crawlers.base import BaseCrawler, get_session
 from src.models import NewsItem
 
 
 class HuggingFaceCrawler(BaseCrawler):
     """爬取 HuggingFace Papers 页面的每日 AI 论文。"""
 
-    def fetch(self) -> list[NewsItem]:
+    def _fetch(self) -> list[NewsItem]:
         url = self.config.get("url", "https://huggingface.co/papers")
         max_results = self.config.get("max_results", 20)
 
         try:
-            resp = requests.get(
+            resp = get_session().get(
                 url,
-                timeout=30,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; ai-news-bot/1.0)"},
+                timeout=self.config.get("timeout", 8),
             )
             resp.raise_for_status()
         except requests.RequestException as e:
@@ -90,13 +89,27 @@ class HuggingFaceCrawler(BaseCrawler):
         if arxiv_id:
             image_url = self._get_arxiv_figure(arxiv_id)
 
+        # 尝试从 arxiv ID 提取发布日期 (格式: 2505.01234 -> 2025-05)
+        published_at = datetime.now(timezone.utc)
+        if arxiv_id:
+            try:
+                # arxiv ID 格式: YYMM.xxxxx
+                year = int(arxiv_id[:2])
+                month = int(arxiv_id[2:4])
+                # 20xx 年
+                year = 2000 + year
+                # 设置为该月1日
+                published_at = datetime(year, month, 1, tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                pass
+
         return NewsItem(
             source="huggingface",
             title=title,
             url=url,
             content=content,
             author=author,
-            published_at=datetime.now(timezone.utc),
+            published_at=published_at,
             tags=["paper", "huggingface"],
             raw_data={"arxiv_id": arxiv_id, "image_url": image_url},
         )
@@ -143,13 +156,25 @@ class HuggingFaceCrawler(BaseCrawler):
         if arxiv_id:
             image_url = self._get_arxiv_figure(arxiv_id)
 
+        # 尝试从 arxiv ID 提取发布日期
+        published_at = datetime.now(timezone.utc)
+        if arxiv_id:
+            try:
+                # arxiv ID 格式: YYMM.xxxxx
+                year = int(arxiv_id[:2])
+                month = int(arxiv_id[2:4])
+                year = 2000 + year
+                published_at = datetime(year, month, 1, tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                pass
+
         return NewsItem(
             source="huggingface",
             title=title,
             url=url,
             content=content,
             author=author,
-            published_at=datetime.now(timezone.utc),
+            published_at=published_at,
             tags=["paper", "huggingface"],
             raw_data={"arxiv_id": arxiv_id, "image_url": image_url},
         )
@@ -184,13 +209,24 @@ class HuggingFaceCrawler(BaseCrawler):
             arxiv_id = href.split("/")[-1] if "/" in href else ""
             image_url = self._get_arxiv_figure(arxiv_id) if arxiv_id else ""
 
+            # 尝试从 arxiv ID 提取发布日期
+            pub_date = datetime.now(timezone.utc)
+            if arxiv_id:
+                try:
+                    year = int(arxiv_id[:2])
+                    month = int(arxiv_id[2:4])
+                    year = 2000 + year
+                    pub_date = datetime(year, month, 1, tzinfo=timezone.utc)
+                except (ValueError, IndexError):
+                    pass
+
             items.append(NewsItem(
                 source="huggingface",
                 title=f"Paper: {arxiv_id}",
                 url=url,
                 content="",
                 author="HuggingFace",
-                published_at=datetime.now(timezone.utc),
+                published_at=pub_date,
                 tags=["paper", "huggingface"],
                 raw_data={"arxiv_id": arxiv_id, "image_url": image_url},
             ))
@@ -219,8 +255,7 @@ class HuggingFaceCrawler(BaseCrawler):
         """从 arxiv HTML 页获取论文图表。"""
         try:
             html_url = f"https://arxiv.org/html/{arxiv_id}"
-            resp = requests.get(html_url, timeout=10,
-                               headers={"User-Agent": "Mozilla/5.0 (compatible; ai-news-bot/1.0)"})
+            resp = get_session().get(html_url, timeout=self.config.get("timeout", 8))
             if resp.status_code != 200:
                 return ""
 

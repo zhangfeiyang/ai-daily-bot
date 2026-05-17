@@ -30,7 +30,7 @@ google:
       blog: "https://deepmind.google/blog"
 
 anthropic:
-  keywords: ["anthropic", "claude", "constitutional ai"]
+  keywords: ["anthropic", "claude", "constitutional ai", "claude code", "claude sonnet", "claude opus"]
   website: "https://www.anthropic.com"
   blog: "https://www.anthropic.com/news"
   twitter: "AnthropicAI"
@@ -38,6 +38,10 @@ anthropic:
   model_leads:
     - name: "Claude"
       twitter: "AnthropicAI"
+  sub_brands:
+    claude_code:
+      twitter: "claudecode"
+      keywords: ["claude code", "claude-code"]
 
 deepseek:
   keywords: ["deepseek", "深度求索"]
@@ -162,3 +166,24 @@ cohere:
   website: "https://cohere.com"
   blog: "https://cohere.com/blog"
   twitter: "CohereAI"
+
+# AI 工具 / Agent 项目（非模型公司，但产品更新值得报道）
+openclaw:
+  keywords: ["openclaw", "open claw", "hermes agent", "hermes"]
+  website: "https://openclaw.ai"
+  twitter: "OpenClawAI"
+
+cursor:
+  keywords: ["cursor", "cursor ide", "cursor editor"]
+  website: "https://cursor.com"
+  twitter: "cursor"
+
+devin:
+  keywords: ["devin", "cognition", "cognition labs"]
+  website: "https://cognition.ai"
+  twitter: "DevinAI"
+
+manus:
+  keywords: ["manus", "manus ai"]
+  website: "https://manus.im"
+  twitter: "manus_ai"

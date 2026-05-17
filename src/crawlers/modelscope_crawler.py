@@ -12,7 +12,7 @@ from src.models import NewsItem
 class ModelScopeCrawler(BaseCrawler):
     """爬取 ModelScope 热门模型。通过 HuggingFace API 搜索 modelscope 相关模型。"""
 
-    def fetch(self) -> list[NewsItem]:
+    def _fetch(self) -> list[NewsItem]:
         max_results = self.config.get("max_results", 15)
 
         items = []
@@ -43,6 +43,15 @@ class ModelScopeCrawler(BaseCrawler):
 
         return self.filter_recent(items)
 
+    @staticmethod
+    def _parse_hf_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
     def _parse_model(self, model: dict) -> NewsItem | None:
         model_id = model.get("modelId", model.get("id", ""))
         if not model_id:
@@ -57,6 +66,14 @@ class ModelScopeCrawler(BaseCrawler):
         if pipeline_tag:
             tags.insert(0, pipeline_tag)
 
+        published_at = (
+            self._parse_hf_timestamp(model.get("lastModified"))
+            or self._parse_hf_timestamp(model.get("createdAt"))
+            or self._parse_hf_timestamp(model.get("last_modified"))
+            or self._parse_hf_timestamp(model.get("created_at"))
+            or datetime.now(timezone.utc)
+        )
+
         title = f"[ModelScope] {name}"
         content = description[:2000] if description else f"模型 {model_id}"
 
@@ -66,7 +83,7 @@ class ModelScopeCrawler(BaseCrawler):
             url=f"https://huggingface.co/{model_id}",
             content=content,
             author=author or "ModelScope",
-            published_at=datetime.now(timezone.utc),
+            published_at=published_at,
             tags=[t for t in tags if isinstance(t, str)][:5],
             raw_data={"model_id": model_id, "image_url": ""},
         )

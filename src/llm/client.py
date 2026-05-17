@@ -1,16 +1,17 @@
 # src/llm/client.py
 import os
 import re
-import subprocess
-from pathlib import Path
+import copy
 
 from loguru import logger
 
 
 class LLMClient:
+    TEXT_PROVIDER = "minimax"
+
     def __init__(self, config: dict):
         self.config = config
-        self.provider = config.get("default", "openai")
+        self.provider = config.get("default", self.TEXT_PROVIDER)
         self._provider_configs = config.get("providers", {})
         self._provider_config = self._provider_configs.get(self.provider, {})
         self.api_key = self._provider_config.get("api_key", "")
@@ -22,6 +23,15 @@ class LLMClient:
         if isinstance(fallbacks, str):
             fallbacks = [fallbacks]
         self.fallback_providers = [name for name in fallbacks if name != self.provider]
+
+    def clone(self, provider: str | None = None, fallback_providers: list[str] | None = None) -> "LLMClient":
+        config = copy.deepcopy(self.config)
+        if provider:
+            config["default"] = provider
+        client = LLMClient(config)
+        if fallback_providers is not None:
+            client.fallback_providers = [p for p in fallback_providers if p != client.provider]
+        return client
 
     def _get_provider_config(self, provider: str) -> dict:
         return self._provider_configs.get(provider, {})
@@ -37,6 +47,7 @@ class LLMClient:
         user_prompt: str,
         max_tokens: int = 16384,
         temperature: float = None,
+        thinking: bool | None = None,
     ) -> str:
         cfg = self._get_provider_config(provider)
         if not cfg:
@@ -44,13 +55,7 @@ class LLMClient:
 
         protocol = self._provider_protocol(provider, cfg)
         if protocol == "opencli":
-            return self._generate_opencli(
-                system_prompt,
-                user_prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                cfg=cfg,
-            )
+            raise ValueError("OpenCLI browser providers are disabled for text generation")
         if protocol == "anthropic":
             return self._generate_anthropic(
                 system_prompt,
@@ -65,6 +70,7 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
             cfg=cfg,
+            provider=provider,
         )
 
     def generate(
@@ -73,32 +79,31 @@ class LLMClient:
         user_prompt: str,
         temperature: float = None,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
     ) -> str:
-        providers = [self.provider] + [p for p in self.fallback_providers if p != self.provider]
-        last_error = None
-        for provider in providers:
-            for attempt in range(3):
-                try:
-                    return self._generate_for_provider(
-                        provider,
-                        system_prompt,
-                        user_prompt,
-                        max_tokens=max_tokens or 16384,
-                        temperature=temperature,
-                    )
-                except Exception as e:
-                    if self._is_timeout_error(e) and attempt < 2:
-                        import time
-                        logger.warning(f"LLM provider '{provider}' timeout (attempt {attempt + 1}/3), retrying in 15s...")
-                        time.sleep(15)
-                        last_error = e
-                        continue
-                    last_error = e
-                    logger.warning(f"LLM provider '{provider}' failed: {e}")
-                    break
-        if last_error:
-            raise last_error
-        raise RuntimeError("No LLM provider available")
+        provider = self.TEXT_PROVIDER
+        if provider not in self._provider_configs:
+            raise ValueError("MiniMax-M2.7 provider config is required for text generation")
+        logger.info(f"Calling text generation provider: {provider}")
+        for attempt in range(3):
+            try:
+                return self._generate_for_provider(
+                    provider,
+                    system_prompt,
+                    user_prompt,
+                    max_tokens=max_tokens or 16384,
+                    temperature=temperature,
+                    thinking=thinking,
+                )
+            except Exception as e:
+                if self._is_timeout_error(e) and attempt < 2:
+                    import time
+                    logger.warning(f"LLM provider '{provider}' timeout (attempt {attempt + 1}/3), retrying in 15s...")
+                    time.sleep(15)
+                    continue
+                logger.warning(f"LLM provider '{provider}' failed: {e}")
+                raise e
+        raise RuntimeError("Minimax text generation failed after retries")
 
     @staticmethod
     def _is_timeout_error(e: Exception) -> bool:
@@ -109,11 +114,22 @@ class LLMClient:
         return err_type.lower() in timeout_names or "timeout" in err_str or "timed out" in err_str
 
     def generate_with_images(self, system_prompt: str, text: str, image_urls: list[str], provider: str = "vision") -> str:
-        """Generate response with image inputs using a specified provider."""
+        """Generate response with image inputs without using browser chat adapters."""
         cfg = self._get_provider_config(provider)
+        if not cfg and provider == "vision":
+            minimax_cfg = self._get_provider_config(self.TEXT_PROVIDER)
+            cfg = {
+                "protocol": "minimax_mcp",
+                "api_key": minimax_cfg.get("api_key", ""),
+                "api_host": minimax_cfg.get("api_host") or minimax_cfg.get("base_url", "https://api.minimaxi.com").removesuffix("/v1"),
+                "timeout": minimax_cfg.get("timeout", self.timeout),
+            }
+        if not cfg:
+            raise ValueError(f"Missing provider config for image understanding: {provider}")
         if cfg.get("protocol") == "opencli":
-            return self._generate_opencli_with_images(system_prompt, text, image_urls, cfg=cfg)
-
+            raise ValueError("OpenCLI browser providers are disabled for image understanding; only image generation may use web models")
+        if (cfg.get("site") or "").lower() == "deepseek":
+            raise ValueError("DeepSeek is disabled for image understanding; use MiniMax vision instead")
         if cfg.get("protocol") == "minimax_mcp":
             from src.minimax_mcp import MiniMaxMCPClient
 
@@ -150,107 +166,6 @@ class LLMClient:
         )
         return response.choices[0].message.content or ""
 
-    def _generate_opencli(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        max_tokens: int = 16384,
-        temperature: float = None,
-        cfg: dict | None = None,
-        extra_args: list[str] | None = None,
-    ) -> str:
-        """Generate text through an OpenCLI browser-backed chat adapter."""
-        cfg = cfg or self._provider_config
-        site = cfg.get("site") or cfg.get("command") or cfg.get("name")
-        if not site:
-            raise ValueError("OpenCLI provider requires a 'site' value")
-
-        timeout_seconds = int(cfg.get("timeout", self.timeout) or self.timeout)
-        prompt = self._compose_opencli_prompt(system_prompt, user_prompt, max_tokens=max_tokens, temperature=temperature)
-
-        cmd = ["opencli", site, "ask", prompt, "--timeout", str(timeout_seconds), "-f", "plain"]
-        if cfg.get("new"):
-            if site == "chatgpt":
-                cmd.append("--new")
-            elif site in {"gemini", "deepseek"}:
-                cmd.extend(["--new", "true"])
-
-        if site == "deepseek":
-            model = cfg.get("model")
-            if model:
-                cmd.extend(["--model", str(model)])
-            if cfg.get("think"):
-                cmd.extend(["--think", "true"])
-            if cfg.get("search"):
-                cmd.extend(["--search", "true"])
-
-        if extra_args:
-            cmd.extend(extra_args)
-
-        logger.info(f"Calling OpenCLI LLM provider '{site}'")
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=max(timeout_seconds + 30, timeout_seconds),
-            check=False,
-        )
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
-            stdout = (proc.stdout or "").strip()
-            raise RuntimeError(f"opencli {site} ask failed ({proc.returncode}): {stderr or stdout}")
-
-        content = (proc.stdout or "").strip()
-        if not content:
-            raise RuntimeError(f"Empty response from opencli provider '{site}'")
-        return self._strip_model_artifacts(content)
-
-    def _generate_opencli_with_images(
-        self,
-        system_prompt: str,
-        text: str,
-        image_urls: list[str],
-        cfg: dict | None = None,
-    ) -> str:
-        """Use OpenCLI for vision review without falling back to API providers."""
-        cfg = cfg or {}
-        site = cfg.get("site") or cfg.get("command") or "deepseek"
-        image_lines = "\n".join(f"{idx}. {url}" for idx, url in enumerate(image_urls or [], 1))
-        prompt = (
-            f"{text}\n\n"
-            "图片输入：\n"
-            f"{image_lines}\n\n"
-            "请结合上面的图片输入完成任务。"
-        ).strip()
-
-        extra_args: list[str] = []
-        if site == "deepseek":
-            local_images = [url for url in image_urls or [] if url and not url.startswith(("http://", "https://", "data:"))]
-            if local_images:
-                path = Path(local_images[0])
-                if path.exists():
-                    extra_args.extend(["--file", str(path)])
-
-        return self._generate_opencli(system_prompt, prompt, cfg=cfg, extra_args=extra_args)
-
-    @staticmethod
-    def _compose_opencli_prompt(
-        system_prompt: str,
-        user_prompt: str,
-        max_tokens: int = 16384,
-        temperature: float = None,
-    ) -> str:
-        parts = []
-        if system_prompt:
-            parts.append("【系统要求】\n" + system_prompt.strip())
-        if user_prompt:
-            parts.append("【用户输入】\n" + user_prompt.strip())
-        if temperature is not None:
-            parts.append(f"【生成参数】temperature={temperature}")
-        if max_tokens:
-            parts.append(f"【长度上限】最多约 {max_tokens} tokens。")
-        return "\n\n---\n\n".join(parts).strip()
-
     @staticmethod
     def _strip_model_artifacts(content: str) -> str:
         content = re.sub(r'<(?:think|thinking)\b[^>]*>.*?</(?:think|thinking)>', '', content, flags=re.DOTALL | re.IGNORECASE)
@@ -286,10 +201,13 @@ class LLMClient:
         max_tokens: int = 16384,
         temperature: float = None,
         cfg: dict | None = None,
+        provider: str = "openai",
     ) -> str:
         import openai
         cfg = cfg or self._provider_config
-        client = openai.OpenAI(api_key=cfg.get("api_key", self.api_key), base_url=cfg.get("base_url", self.base_url), timeout=self.timeout)
+        api_key = cfg.get("api_key") or self.api_key or os.environ.get(f"{cfg.get('site', '').upper() or provider.upper()}_API_KEY")
+        base_url = cfg.get("base_url") or self.base_url
+        client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
         kwargs = {
             "model": cfg.get("model", self.model),
             "messages": [
@@ -302,7 +220,13 @@ class LLMClient:
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = client.chat.completions.create(**kwargs)
+        provider_name = cfg.get("site") or provider
+        logger.info(f"Calling OpenAI compatible provider '{provider_name}' with model {kwargs.get('model')}")
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error(f"OpenAI compatible client error: {e}")
+            raise e
         if hasattr(response, "choices"):
             content = response.choices[0].message.content or ""
         else:
@@ -318,7 +242,10 @@ class LLMClient:
         if not content.strip():
             raise RuntimeError("Empty response from openai-compatible provider")
         # 去除推理标记。部分兼容接口会把 reasoning 泄漏到 content。
-        return self._strip_model_artifacts(content)
+        cleaned = self._strip_model_artifacts(content)
+        if not cleaned.strip():
+            raise RuntimeError("Empty response from openai-compatible provider after cleanup")
+        return cleaned
 
     def _generate_anthropic(
         self,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""分析新智元、机器之心、量子位的参考链接和Twitter关注。
+"""分析十字路口、机器之心、量子位的参考链接和Twitter关注。
 
 Usage:
     python analyze_media.py [--output OUTPUT] [--max-articles N]

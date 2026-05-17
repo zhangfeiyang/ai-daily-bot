@@ -7,6 +7,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from src.utils.opencli_browser import capture_screenshot_via_opencli
+
 
 class HuggingFaceScreenshot:
     """Capture screenshots of HuggingFace model/dataset/space pages."""
@@ -53,7 +55,7 @@ class HuggingFaceScreenshot:
 
                 if not browser:
                     logger.error("No browser could be launched")
-                    return None
+                    raise RuntimeError("No browser could be launched")
 
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
@@ -94,8 +96,11 @@ class HuggingFaceScreenshot:
                 except Exception as e:
                     logger.warning(f"HuggingFace capture failed: {e}")
                     browser.close()
-                    return None
+                    raise
 
         except Exception as e:
             logger.warning(f"Failed to capture HuggingFace screenshot: {e}")
+            fallback = capture_screenshot_via_opencli(page_url, cache_path, full_page=False)
+            if fallback:
+                return fallback
             return None

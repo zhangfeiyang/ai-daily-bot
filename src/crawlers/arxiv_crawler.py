@@ -10,7 +10,7 @@ from src.models import NewsItem
 
 
 class ArxivCrawler(BaseCrawler):
-    def fetch(self) -> list[NewsItem]:
+    def _fetch(self) -> list[NewsItem]:
         categories = self.config.get("categories", ["cs.AI"])
         max_results = self.config.get("max_results", 20)
         sort_by = self.config.get("sort_by", "submittedDate")

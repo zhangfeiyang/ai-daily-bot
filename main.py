@@ -1,5 +1,8 @@
 # main.py
 import sys
+from dotenv import load_dotenv
+load_dotenv()
+
 import time
 from pathlib import Path
 import re
@@ -125,8 +128,7 @@ def _prepare_article_html_for_draft(html: str, article_file: Path) -> str:
         body = re.sub(r"<!--\s*ARTICLE_TITLE:.*?-->\s*", "", html, flags=re.S)
         body = re.sub(r"<!--\s*THUMB_MEDIA_ID:.*?-->\s*", "", body, flags=re.S)
         repaired = Pipeline._clean_final_article_html(body)
-        repaired = Pipeline._ensure_lead_section(repaired, Pipeline._strip_html(repaired))
-        repaired = Pipeline._clean_final_article_html(repaired)
+        repaired = Pipeline._apply_xzyuan_feature_style(repaired, Pipeline._strip_html(repaired))
         title = _extract_article_title_from_html(html)
         thumb = _extract_thumb_media_id_from_html(html)
         meta = []
@@ -183,6 +185,9 @@ def _upload_feature_drafts(publisher: WeChatPublisher) -> bool:
             html = _prepare_article_html_for_draft(html, article_file)
             title = _extract_article_title_from_html(html, fallback=article_file.stem)
             thumb_media_id = _extract_thumb_media_id_from_html(html)
+            if not thumb_media_id:
+                logger.error(f"Feature draft missing generated cover thumb, skipping: {article_file}")
+                continue
             media_id = _retry_call(
                 publisher.create_draft,
                 title=title,

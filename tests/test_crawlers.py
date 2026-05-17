@@ -118,7 +118,14 @@ def test_reddit_crawler_fetch(mock_opencli_search):
     assert items[0].title == "New breakthrough in LLM"
     assert items[0].author == "ml_researcher"
     assert items[0].raw_data["reddit_score"] == 321
-    mock_opencli_search.assert_called_once()
+    assert items[0].raw_data["search_time_filter"] == "day"
+    assert items[0].raw_data["published_at_source"] == "opencli_reddit_search_window"
+    mock_opencli_search.assert_called_once_with(
+        "MachineLearning",
+        limit=10,
+        time_filter="day",
+        sort="hot",
+    )
 
 
 @patch("src.crawlers.reddit_crawler.opencli_reddit_search")
@@ -151,11 +158,32 @@ def test_reddit_crawler_search_queries_use_opencli(mock_opencli_search):
     assert items[0].source == "reddit"
     assert items[0].title.startswith("Open AI's Codex")
     assert items[0].raw_data["subreddit"] == "vibecoding"
-    mock_opencli_search.assert_called_once()
+    mock_opencli_search.assert_called_once_with(
+        "Codex",
+        limit=1,
+        time_filter="day",
+        sort="top",
+    )
+
+
+def test_reddit_crawler_cache_key_includes_search_window():
+    base_config = {
+        "search_queries": ["Codex"],
+        "limit": 1,
+        "min_score": 20,
+        "time_filter": "day",
+        "sort": "top",
+    }
+    day_key = RedditCrawler(base_config).get_cache_key()
+    week_key = RedditCrawler({**base_config, "time_filter": "week"}).get_cache_key()
+
+    assert day_key != week_key
+    assert "time=day" in day_key
 
 
 @patch("src.crawlers.aihot_crawler.requests.get")
 def test_aihot_crawler_fetches_rss(mock_get):
+    pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     mock_get.return_value.status_code = 200
     mock_get.return_value.raise_for_status = MagicMock()
     mock_get.return_value.text = """
@@ -164,11 +192,11 @@ def test_aihot_crawler_fetches_rss(mock_get):
         <title>Symphony为每个任务启动运行Codex智能体</title>
         <link>https://x.com/OpenAIDevs/status/2054252221941121035</link>
         <description>OpenAI Developers update</description>
-        <pubDate>Fri, 15 May 2026 01:33:00 GMT</pubDate>
+        <pubDate>{pub_date}</pubDate>
         <category>OpenAI</category>
       </item>
     </channel></rss>
-    """
+    """.format(pub_date=pub_date)
 
     crawler = AIHotCrawler({
         "feeds": ["https://aihot.virxact.com/feed.xml"],

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from src.utils.opencli_browser import capture_screenshot_via_opencli
+
 
 class RedditScreenshot:
     """Capture screenshots of Reddit posts and comments."""
@@ -66,7 +68,7 @@ class RedditScreenshot:
 
                 if not browser:
                     logger.error("No browser could be launched")
-                    return None
+                    raise RuntimeError("No browser could be launched")
 
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
@@ -134,14 +136,17 @@ class RedditScreenshot:
                     else:
                         logger.warning(f"Reddit returned status {response.status if response else 'None'}")
                         browser.close()
-                        return None
+                        raise RuntimeError(f"Reddit returned status {response.status if response else 'None'}")
                 except Exception as e:
                     logger.warning(f"Reddit capture failed: {e}")
                     browser.close()
-                    return None
+                    raise
 
         except Exception as e:
             logger.warning(f"Failed to capture Reddit screenshot: {e}")
+            fallback = capture_screenshot_via_opencli(post_url, cache_path, full_page=False)
+            if fallback:
+                return fallback
             return None
 
     def capture_from_text(self, text: str) -> Path | None:
